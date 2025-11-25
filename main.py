@@ -63,6 +63,17 @@ def init_db():
                      (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
                       color TEXT, tags TEXT, description TEXT, 
                       width INTEGER, height INTEGER)''')
+    try:
+        c.execute("ALTER TABLE photos ADD COLUMN is_live INTEGER DEFAULT 0")
+    except:
+        pass
+
+        # 确保建表语句也包含
+    c.execute('''CREATE TABLE IF NOT EXISTS photos 
+                     (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
+                      color TEXT, tags TEXT, description TEXT, 
+                      width INTEGER, height INTEGER, is_live INTEGER)''')
+
 
 
     conn.commit()
@@ -162,6 +173,35 @@ def delete_root(path: str):
     return {"status": "success", "roots": roots}
 
 
+def check_is_live(path):
+    """检测是否为 Live Photo (通过检查文件末尾是否包含 MP4 结构)"""
+    try:
+        if not path.lower().endswith(('.jpg', '.jpeg')):
+            return 0
+
+        # 预判：文件太小肯定不是 Live
+        file_size = os.path.getsize(path)
+        if file_size < 1024 * 1024:  # 小于 1MB 直接跳过
+            return 0
+
+        with open(path, 'rb') as f:
+            # 优化：为了性能，我们不需要读整个文件来检测
+            # 只需要读最后 20MB (通常 Live 视频不会特别大) 或者读全部
+            # 如果不想改太复杂，读全部也是最稳的
+            data = f.read()
+
+            # 逻辑必须和 get_live_video 保持一致
+            idx = data.rfind(b'ftyp')
+
+            # 如果找到了 ftyp，且位置不在文件开头（说明是拼接在后面的），就认为是 Live
+            if idx > 1000:  # 至少给 JPG 留点空间
+                return 1
+
+    except Exception as e:
+        print(f"Check live error: {e}")
+        pass
+
+    return 0
 @app.get("/api/scan")
 def scan_photos():
     root_dirs = get_root_dirs()
@@ -199,14 +239,26 @@ def scan_photos():
                 full_path = os.path.normpath(os.path.join(root, f))
 
                 # 修改 SQL 查询，多查 width 和 height
-                row = conn.execute("SELECT rating, color, tags, description, width, height FROM photos WHERE path=?",
-                                   (full_path,)).fetchone()
+                row = conn.execute(
+                    "SELECT rating, color, tags, description, width, height, is_live FROM photos WHERE path=?",
+                    (full_path,)).fetchone()
 
                 tags_list = []
                 if row and row['tags']:
                     tags_list = row['tags'].split(",")
-
-                # --- 修改开始：智能获取宽高 ---
+                is_live = row['is_live'] if row else 0
+                # 如果数据库里是 0，但我们没扫过（或者想强制重扫），可以重新检测
+                # 这里逻辑：如果是新插入的(row不存在)，检测一下
+                if not row or is_live == 0:
+                    # 只有当确实检测到是 1 时，我们才更新。如果是 0，保持原状（避免重复检测耗时，虽然这里简单处理了）
+                    # 为了更严谨，我们可以每次都检测，但为了性能，这里假设如果已经是 1 了就不用测了
+                    if is_live == 0:
+                        detected_live = check_is_live(full_path)
+                        if detected_live:
+                            is_live = 1
+                            # 记得把新状态更新回数据库！
+                            conn.execute("UPDATE photos SET is_live=1 WHERE path=?", (full_path,))
+                            conn.commit()
                 width = row['width'] if row else 0
                 height = row['height'] if row else 0
 
@@ -230,7 +282,8 @@ def scan_photos():
                     "rating": row['rating'] if row else 0,
                     "color": row['color'] if row else "none",
                     "tags": tags_list,
-                    "description": row['description'] if row else ""
+                    "description": row['description'] if row else "",
+                    "is_live": is_live
                 })
 
             # 确定封面
@@ -266,6 +319,38 @@ def scan_photos():
     conn.close()
     return all_galleries
 
+
+@app.get("/api/live_video")
+def get_live_video(path: str):
+    """从 Live Photo 中提取视频流"""
+    if not os.path.exists(path):
+        return FileResponse(path)
+
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+
+        idx = data.rfind(b'ftyp')
+
+        if idx > 4:
+            video_start = idx - 4
+            # ... (中间的校验逻辑保持不变) ...
+            video_data = data[video_start:]
+
+            # --- 修改重点：添加 Cache-Control 头 (缓存1年) ---
+            headers = {"Cache-Control": "public, max-age=31536000"}
+
+            return StreamingResponse(
+                BytesIO(video_data),
+                media_type="video/mp4",
+                headers=headers  # <--- 加上这个
+            )
+        else:
+            raise HTTPException(status_code=404, detail="No video found")
+
+    except Exception as e:
+        print(f"Video extract error: {e}")
+        raise HTTPException(status_code=500, detail="Error extracting video")
 
 # 定义缓存目录
 THUMB_CACHE_DIR = ".thumb_cache"
