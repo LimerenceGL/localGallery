@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>晓彤的图库</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        gray: { 850: '#1f2937', 900: '#111827', 950: '#0b0f19' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        [v-cloak] { display: none; }
+
+        /* 真正的 Masonry (瀑布流) - CSS Columns 方式 */
+        .masonry-columns {
+            column-count: 1;
+            column-gap: 1rem;
+        }
+        @media (min-width: 640px) { .masonry-columns { column-count: 2; } }
+        @media (min-width: 768px) { .masonry-columns { column-count: 3; } }
+        @media (min-width: 1024px) { .masonry-columns { column-count: 4; } }
+        @media (min-width: 1536px) { .masonry-columns { column-count: 5; } }
+
+        .masonry-item {
+            break-inside: avoid;
+            margin-bottom: 1rem;
+        }
+
+        /* 树形菜单动画 */
+        .tree-enter-active, .tree-leave-active { transition: all 0.3s ease; max-height: 2000px; overflow: hidden; }
+        .tree-enter-from, .tree-leave-to { max-height: 0; opacity: 0; }
+
+        /* 图片查看器拖拽 */
+        .grabbing { cursor: grabbing; }
+        .grab { cursor: grab; }
+    </style>
+</head>
+<body class="bg-gray-100 dark:bg-gray-950 text-gray-800 dark:text-gray-200 font-sans h-screen flex overflow-hidden">
+
+<div id="app" v-cloak class="flex w-full h-full">
+
+    <aside class="w-72 bg-white dark:bg-gray-900 border-r border-gray-200 dark:border-gray-800 flex flex-col transition-all duration-300 shrink-0 z-20"
+           :class="{'w-0  border-none overflow-hidden': !sidebarOpen}">
+        <div class="p-4 h-16 border-b border-gray-200 dark:border-gray-800 flex items-center justify-between shrink-0">
+            <span class="font-bold text-xl tracking-wider">GALLERY</span>
+        </div>
+
+        <div class="flex-1 overflow-y-auto no-scrollbar p-2">
+            <div @click="goHome" class="cursor-pointer p-2 rounded-md font-semibold hover:bg-gray-100 dark:hover:bg-gray-800 mb-2 flex items-center gap-2"
+                 :class="{'bg-blue-50 dark:bg-gray-800 text-blue-600': viewMode === 'home'}">
+                <span>🏠</span> 图库主页
+            </div>
+
+            <div v-if="loading" class="text-sm text-gray-400 p-2">扫描中...</div>
+
+            <folder-tree
+                v-for="node in folderTree"
+                :key="node.path"
+                :node="node"
+                :current-path="currentAlbum?.folder_path"
+                @select="selectAlbum">
+            </folder-tree>
+        </div>
+
+        <div class="p-4 border-t border-gray-200 dark:border-gray-800 text-xs text-gray-500 flex justify-between">
+             <span>{{ flatAlbums.length }} 个相册</span>
+             <button @click="openSystemPicker" class="hover:text-blue-500 font-bold">+ 添加目录</button>
+        </div>
+    </aside>
+
+    <main class="flex-1 flex flex-col h-full relative w-full overflow-hidden bg-gray-50 dark:bg-black">
+
+        <header class="h-16 border-b border-gray-200 dark:border-gray-800 flex items-center px-4 justify-between bg-white/90 dark:bg-gray-900/90 backdrop-blur-md z-10 shrink-0 shadow-sm">
+            <div class="flex items-center gap-2 md:gap-4">
+            </div>
+
+            <div class="flex items-center gap-3">
+                <button v-if="viewMode === 'album' && currentAlbum && currentAlbum.folder_path === currentAlbum.root_root"
+                        @click="removeCurrentAlbum"
+                        title="从图库移除此相册"
+                        class="p-2 text-gray-500 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-full transition-colors">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                </button>
+                <div class="relative group">
+                    <span class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">🔍</span>
+                    <input v-model="filter.search"
+                           placeholder="搜索全库..."
+                           class="pl-9 pr-3 py-1.5 w-32 focus:w-48 transition-all bg-gray-100 dark:bg-gray-800 border-none rounded-full text-sm focus:ring-2 focus:ring-blue-500 outline-none">
+                </div>
+                <div class="flex items-center gap-1.5 border-r border-gray-300 dark:border-gray-600 pr-3 mr-1">
+                    <button v-for="c in ['red','yellow','green','blue','purple']"
+                            @click="toggleFilter('color', c)"
+                            :title="c"
+                            class="w-4 h-4 rounded-full transition-all duration-200 border border-transparent"
+                            :class="[
+                                filter.color === c ? 'scale-125 ring-2 ring-offset-2 ring-blue-500 dark:ring-offset-gray-900' : 'hover:scale-110 opacity-70 hover:opacity-100',
+                            ]"
+                            :style="{backgroundColor: c}">
+                    </button>
+                    <button v-if="filter.color" @click="filter.color = null" class="ml-1 text-xs text-gray-400 hover:text-red-500">✕</button>
+                </div>
+
+                <div class="relative flex items-center">
+                    <span class="text-yellow-500 mr-1 text-sm">★</span>
+                    <select v-model="filter.minRating"
+                            class="appearance-none bg-transparent text-sm font-medium pr-6 cursor-pointer outline-none text-gray-700 dark:text-gray-200 hover:text-blue-500">
+                        <option :value="0" class="text-gray-900">全部评级</option>
+                        <option :value="1" class="text-gray-900">1星 及以上</option>
+                        <option :value="2" class="text-gray-900">2星 及以上</option>
+                        <option :value="3" class="text-gray-900">3星 及以上</option>
+                        <option :value="4" class="text-gray-900">4星 及以上</option>
+                        <option :value="5" class="text-gray-900">仅 5星</option>
+                    </select>
+                    <div class="absolute right-0 top-1/2 -translate-y-1/2 pointer-events-none text-gray-400">
+                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                    </div>
+                </div>
+                <button @click="toggleTheme" class="p-2 hover:bg-gray-200 dark:hover:bg-gray-800 rounded-full">
+                    {{ isDark ? '🌞' : '🌙' }}
+                </button>
+            </div>
+        </header>
+
+        <div class="flex-1 overflow-y-auto p-4 md:p-6 focus:outline-none scroll-smooth" id="main-scroll">
+
+            <div v-if="viewMode === 'home'" class="max-w-7xl mx-auto">
+
+                <div v-if="hasActiveFilter" class="mb-8">
+                    <h2 class="text-xl font-bold mb-4 px-2">
+                        筛选结果
+                        <span v-if="filter.search">"{{ filter.search }}"</span>
+                        ({{ filteredPhotos.length }})
+                    </h2>
+                    <div class="masonry-columns">
+                        <div v-for="photo in filteredPhotos" :key="photo.path" class="masonry-item relative group cursor-pointer" @click="openViewer(photo)">
+                            <img :src="`/api/image?path=${encodeURIComponent(photo.path)}&thumb=true`" class="w-full h-auto rounded-lg mb-4">
+                            </div>
+                    </div>
+                </div>
+
+                <div v-else>
+                    <div v-if="flatAlbums.length === 0 && !loading" class="text-center py-20 text-gray-500">
+                        <p class="text-xl mb-4">还没有图库</p>
+                        <button @click="openSystemPicker" class="bg-blue-600 text-white px-6 py-2 rounded-lg hover:bg-blue-700 shadow-lg transition">添加文件夹</button>
+                    </div>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+                         <div v-for="album in rootAlbums" :key="album.folder_path"
+                                 @click="selectAlbum(album)"
+                                 class="group cursor-pointer bg-white dark:bg-gray-900 rounded-xl overflow-hidden shadow-sm hover:shadow-xl transition-all duration-300 border border-gray-200 dark:border-gray-800">
+                                <div class="aspect-[4/3] overflow-hidden bg-gray-200 dark:bg-gray-800 relative">
+                                    <img v-if="album.cover" :src="`/api/image?path=${encodeURIComponent(album.cover)}&thumb=true`" class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500">
+                                    <div v-else class="w-full h-full flex items-center justify-center text-4xl">📁</div>
+                                    <div class="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors"></div>
+                                </div>
+                                <div class="p-4">
+                                    <h3 class="font-bold text-lg truncate mb-1 text-gray-800 dark:text-gray-100">{{ album.name }}</h3>
+                                    <p class="text-sm text-gray-500 flex justify-between">
+                                        <span>{{ album.root_root }}</span>
+                                        <span class="bg-gray-100 dark:bg-gray-800 px-2 py-0.5 rounded text-xs">{{ album.count }}P</span>
+                                    </p>
+                                </div>
+                            </div>
+                    </div>
+                </div>
+
+            </div>
+
+            <div v-else-if="viewMode === 'album'">
+                <div v-if="filteredPhotos.length === 0" class="text-center py-20 text-gray-500">
+                    没有符合条件的照片
+                </div>
+
+                <div v-for="(group, date) in groupedPhotos" :key="date" class="mb-8">
+                    <h3 class="text-lg font-bold text-gray-500 mb-4 sticky top-0 z-[5] py-2 bg-gray-50/90 dark:bg-black/90 backdrop-blur-sm">{{ date }}</h3>
+
+                    <div class="masonry-columns">
+                        <div v-for="photo in group" :key="photo.path"
+                             class="masonry-item relative group rounded-lg overflow-hidden bg-gray-200 dark:bg-gray-800 cursor-pointer shadow-sm hover:shadow-lg transition-shadow"
+                             @click="openViewer(photo)">
+
+                            <img :src="`/api/image?path=${encodeURIComponent(photo.path)}&thumb=true`"
+                                 loading="lazy"
+                                 class="w-full h-auto block transform transition-transform duration-700 hover:scale-105">
+
+                            <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3 pointer-events-none">
+
+                                <div v-if="photo.description" class="mb-2">
+                                    <p class="text-xs text-white/90 font-medium line-clamp-2 leading-relaxed drop-shadow-md">
+                                        {{ photo.description }}
+                                    </p>
+                                </div>
+                                <div class="flex justify-between items-end">
+                                    <div class="flex gap-1">
+                                        <div v-if="photo.color && photo.color !== 'none'" :style="{backgroundColor: photo.color}" class="w-3 h-3 rounded-full border border-white/50 shadow-sm"></div>
+                                        </div>
+                                    <span v-if="photo.rating > 0" class="text-yellow-400 text-xs font-bold drop-shadow-sm">★{{ photo.rating }}</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <div v-if="previewPhoto"
+     class="fixed inset-0 z-50 flex flex-col transition-colors duration-300"
+     :class="viewerBg === 'white' ? 'bg-white' : 'bg-black'"
+     tabindex="0" @keydown="handleViewerKey" ref="viewerEl">
+
+        <div class="absolute top-0 left-0 right-0 p-4 flex justify-between items-start z-50 pointer-events-none">
+             <div class="pointer-events-auto transition-colors" :class="viewerBg === 'white' ? 'text-gray-900' : 'text-white/80'">
+                 <p class="font-bold text-base drop-shadow-md">{{ previewPhoto.name }}</p>
+                 <p class="text-xs opacity-70">{{ previewPhoto.date }} • {{ previewPhoto.width }}x{{ previewPhoto.height }}</p>
+             </div>
+
+             <button @click="closeViewer"
+                     class="pointer-events-auto p-2 rounded-full hover:bg-gray-500/20 transition"
+                     :class="viewerBg === 'white' ? 'text-gray-900' : 'text-white'">
+                 <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M6 18L18 6M6 6l12 12"></path></svg>
+             </button>
+        </div>
+        <div class="flex-1 relative overflow-hidden flex items-center justify-center select-none"
+             @mousedown="startDrag" @mousemove="onDrag" @mouseup="endDrag" @mouseleave="endDrag"
+             @wheel.prevent="handleZoom">
+
+             <div class="absolute inset-0 flex items-center justify-center text-white/20" v-if="imgLoading">Loading...</div>
+
+                <img :src="`/api/image?path=${encodeURIComponent(previewPhoto.path)}`"
+                     ref="fullImage"
+                     @load="imgLoading = false"
+                     @mousedown.prevent="startDrag"
+                     class="transition-transform duration-75 ease-linear max-w-full max-h-full object-contain shadow-2xl"
+                     :style="{
+                         transform: `translate(${panX}px, ${panY}px) scale(${zoom}) rotate(${rotation}deg)`,
+                         cursor: isDragging ? 'grabbing' : 'grab'
+                     }">
+
+            <button v-if="hasPrev" @click.stop="prevPhoto" class="absolute left-4 top-1/2 -translate-y-1/2 p-4 text-white/30 hover:text-white hover:bg-black/30 rounded-full transition text-3xl">❮</button>
+            <button v-if="hasNext" @click.stop="nextPhoto" class="absolute right-4 top-1/2 -translate-y-1/2 p-4 text-white/30 hover:text-white hover:bg-black/30 rounded-full transition text-3xl">❯</button>
+        </div>
+        <div class="shrink-0 py-3 px-4 flex flex-col md:flex-row gap-4 items-center justify-between z-50 backdrop-blur-md transition-colors border-t"
+             :class="viewerBg === 'white' ? 'bg-white/90 border-gray-200 text-gray-800' : 'bg-gray-900/95 border-gray-800 text-gray-200'">
+
+            <div class="w-full md:w-1/3 flex flex-col gap-1 text-left relative group">
+                <label class="text-[10px] font-bold uppercase tracking-widest opacity-60 ml-1">Story</label>
+
+                <textarea v-if="isEditingDesc"
+                          ref="descInput"
+                          v-model="previewPhoto.description"
+                          @blur="saveDescription"
+                          @keydown.enter.prevent="saveDescription"
+                          @change="updateMeta(previewPhoto, 'description', $event.target.value)"
+                          rows="2"
+                          class="w-full text-xs p-2 rounded-lg border focus:border-blue-500 outline-none resize-none shadow-inner"
+                          :class="viewerBg === 'white' ? 'bg-gray-100 text-gray-800 border-gray-300' : 'bg-gray-800/50 text-white border-blue-500/50'"
+                          placeholder="写下这张照片的故事..."></textarea>
+
+                <div v-else
+                     @click="isEditingDesc = true; $nextTick(() => $refs.descInput?.focus())"
+                     class="cursor-text min-h-[40px] px-2 flex items-center rounded-lg transition-colors"
+                     :class="viewerBg === 'white' ? 'hover:bg-gray-100' : 'hover:bg-white/5'">
+                    <p v-if="previewPhoto.description" class="text-xs leading-relaxed whitespace-pre-wrap line-clamp-2">
+                        {{ previewPhoto.description }}
+                    </p>
+                    <p v-else class="text-xs italic select-none opacity-50">点击添加描述...</p>
+                </div>
+            </div>
+
+            <div class="flex flex-row items-center gap-4">
+                <div class="flex gap-1 text-lg">
+                    <button v-for="i in 5" @click="ratePhoto(previewPhoto, i)"
+                            class="transition transform hover:scale-110 focus:outline-none"
+                            :class="i <= previewPhoto.rating ? 'text-yellow-400' : (viewerBg==='white'?'text-gray-300':'text-gray-700')">★</button>
+                </div>
+
+                <div class="h-4 w-px bg-gray-500/30"></div>
+
+                <div class="flex gap-1.5 p-1 rounded-full border"
+                     :class="viewerBg==='white'?'border-gray-200 bg-gray-50':'border-gray-700 bg-gray-800'">
+                    <button v-for="c in ['red','yellow','green','blue','purple']"
+                            @click="colorPhoto(previewPhoto, c)"
+                            class="w-3.5 h-3.5 rounded-full border border-transparent hover:scale-125 transition shadow-sm"
+                            :class="previewPhoto.color === c ? 'ring-2 ring-offset-1 ring-gray-400' : ''"
+                            :style="{backgroundColor: c}"></button>
+                    <button @click="colorPhoto(previewPhoto, 'none')" class="text-xs opacity-50 hover:opacity-100 px-1">✕</button>
+                </div>
+            </div>
+
+            <div class="flex items-center gap-2 md:gap-4">
+                <button @click="toggleViewerBg" class="p-2 rounded-full hover:bg-gray-500/20 transition" title="切换背景">
+                    <span v-if="viewerBg==='black'">⚪</span><span v-else>⚫</span>
+                </button>
+                <div class="h-6 w-px bg-gray-500/30"></div>
+                <button @click="setAsCover(previewPhoto)" class="p-2 rounded-full hover:bg-gray-500/20 transition" title="设为封面">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                </button>
+                <button @click="rotateRight" class="p-2 rounded-full hover:bg-gray-500/20 transition" title="旋转">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                </button>
+                <button @click="resetView" class="p-2 rounded-full hover:bg-gray-500/20 transition" title="重置">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"></path></svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script type="text/x-template" id="folder-tree-template">
+    <div class="select-none text-sm">
+        <div class="flex items-center hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors rounded">
+
+            <div @click.stop="toggle"
+                 class="p-2 cursor-pointer text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 w-8 flex justify-center shrink-0">
+                <span v-if="hasChildren" class="transform transition-transform text-xs" :class="{'rotate-90': isOpen}">▶</span>
+            </div>
+
+            <div @click.stop="selectNode"
+                 class="flex-1 p-2 pl-0 cursor-pointer truncate"
+                 :class="{'text-blue-600 font-bold': isSelected}">
+                <span :title="node.name">{{ node.name }}</span>
+                <span class="text-xs text-gray-400 ml-1" v-if="node.count">({{ node.count }})</span>
+            </div>
+        </div>
+
+        <transition name="tree">
+            <div v-if="isOpen && hasChildren" class="pl-4 border-l border-gray-200 dark:border-gray-800 ml-2">
+                <folder-tree
+                    v-for="child in node.children"
+                    :key="child.path"
+                    :node="child"
+                    :current-path="currentPath"
+                    @select="$emit('select', $event)">
+                </folder-tree>
+            </div>
+        </transition>
+    </div>
+</script>
+
+<script>
+const { createApp, ref, computed, onMounted, nextTick, reactive } = Vue;
+
+// 递归组件定义
+const FolderTree = {
+    name: 'FolderTree',
+    template: '#folder-tree-template',
+    props: ['node', 'currentPath'],
+    emits: ['select'],
+    setup(props, { emit }) {
+        // 默认不展开，除非是根目录或者当前路径包含在内(这需要更复杂的逻辑，暂时保持默认关闭或手动开启)
+        const isOpen = ref(false);
+        const hasChildren = computed(() => props.node.children && props.node.children.length > 0);
+
+        // 只有当 node.data 存在（即这是一个真实的包含图片的相册）且路径匹配时，才算“选中”
+        // 如果只是中间目录（没有图片），path 可能不匹配，或者 node.data 为 null
+        const isSelected = computed(() => props.node.data && props.currentPath === props.node.path);
+
+        // 动作1：切换展开
+        const toggle = () => {
+            if (hasChildren.value) {
+                isOpen.value = !isOpen.value;
+            }
+        };
+
+        // 动作2：选中相册
+        const selectNode = () => {
+            // 只有当该节点有关联的相册数据时，才触发选中
+            // 如果是纯父级文件夹（只有子文件夹没有图片），点击文字可能不需要反应，或者可以设计为“也展开”
+            if (props.node.data) {
+                emit('select', props.node.data);
+            } else {
+                // 如果用户点击了没有图片的父目录名字，为了体验好，也可以帮他展开
+                toggle();
+            }
+        };
+
+        return { isOpen, hasChildren, isSelected, toggle, selectNode };
+    }
+};
+
+createApp({
+    components: { FolderTree },
+    setup() {
+        const flatAlbums = ref([]); // 后端返回的原始数据
+        const folderTree = ref([]); // 转换后的树形结构
+        const currentAlbum = ref(null);
+        const viewMode = ref('home'); // 'home' | 'album'
+        const sidebarOpen = ref(true);
+        const isDark = ref(true);
+        const loading = ref(false);
+        const isEditingDesc = ref(false);
+        // 预览器状态
+        const previewPhoto = ref(null);
+        const imgLoading = ref(false);
+        const zoom = ref(1);
+        const rotation = ref(0);
+        const panX = ref(0);
+        const panY = ref(0);
+        const isDragging = ref(false);
+        const viewerBg = ref('black');
+        let dragStart = { x: 0, y: 0 };
+
+        const filter = ref({ minRating: 0, color: null, search: '' });
+        const toggleViewerBg = () => viewerBg.value = viewerBg.value === 'black' ? 'white' : 'black';
+
+        // --- 数据加载与树构建 ---
+
+        const loadData = async () => {
+            loading.value = true;
+            try {
+                const res = await fetch('/api/scan');
+                const data = await res.json();
+                flatAlbums.value = data || [];
+                buildTreeStructure(flatAlbums.value);
+            } catch(e) { console.error(e); }
+            finally { loading.value = false; }
+        };
+
+        const buildTreeStructure = (albums) => {
+            // 将平铺的相册列表转换为树
+            // 算法：根据 root_root 和 rel_path
+            const tree = [];
+
+            // 1. 先把所有节点按路径放入 Map
+            const nodeMap = {};
+
+            albums.forEach(album => {
+                // 标准化路径
+                const parts = album.rel_path === '.' ? [] : album.rel_path.split(/[\\/]/);
+                let currentLevel = tree;
+                let pathKey = album.root_root; // 唯一键前缀
+
+                // 处理根目录节点
+                let rootNode = tree.find(n => n.path === album.root_root);
+                if (!rootNode) {
+                    rootNode = {
+                        name: album.root_root.split(/[\\/]/).pop(), // 显示名
+                        path: album.root_root,
+                        children: [],
+                        data: null // 根节点可能不是一个具体的相册（如果只有子文件夹有图片）
+                    };
+                    tree.push(rootNode);
+                }
+
+                // 如果是根目录本身的相册
+                if (parts.length === 0) {
+                    rootNode.data = album;
+                    rootNode.count = album.count;
+                    return;
+                }
+
+                // 处理子目录
+                let parent = rootNode;
+                parts.forEach((part, index) => {
+                    pathKey += '/' + part;
+                    let existing = parent.children.find(c => c.name === part);
+                    if (!existing) {
+                        existing = {
+                            name: part,
+                            path: pathKey, // 虚拟路径ID
+                            children: [],
+                            data: null,
+                            count: 0
+                        };
+                        parent.children.push(existing);
+                    }
+                    // 如果到了最后一级，关联相册数据
+                    if (index === parts.length - 1) {
+                        existing.data = album;
+                        existing.count = album.count;
+                    }
+                    parent = existing;
+                });
+            });
+
+            folderTree.value = tree;
+        };
+
+        const rootAlbums = computed(() => {
+            // 在主页显示的相册：所有根目录下的第一级相册或根目录本身
+            // 这里简单处理：显示所有 flatAlbums 中 rel_path 为 . 或者第一级的
+            // 或者直接显示 flatAlbums 里的每一个条目作为平铺展示
+            return flatAlbums.value;
+        });
+
+        const saveDescription = () => {
+            isEditingDesc.value = false;
+            // updateMeta 会自动发送请求，无需额外操作，input 的 @change 或 v-model 已经更新了 previewPhoto.description
+            // 但为了确保万无一失，可以在这里再次触发 updateMeta (可选)
+        };
+        const removeCurrentAlbum = async () => {
+            if (!currentAlbum.value) return;
+
+            // 二次确认，防止误删
+            if (!confirm(`确定要将 "${currentAlbum.value.name}" 从图库中移除吗？\n(注意：硬盘上的文件不会被删除)`)) {
+                return;
+            }
+
+            try {
+                // 调用后端 API 删除 root
+                const res = await fetch(`/api/roots?path=${encodeURIComponent(currentAlbum.value.folder_path)}`, {
+                    method: 'DELETE'
+                });
+                const data = await res.json();
+
+                if (data.status === 'success') {
+                    alert('相册已移除');
+                    // 重新加载数据并回到主页
+                    loadData();
+                    goHome();
+                }
+            } catch (e) {
+                alert('移除失败: ' + e);
+            }
+        };
+        // --- 核心操作 ---
+
+        const openSystemPicker = async () => {
+            try {
+                const res = await fetch('/api/pick_folder');
+                const data = await res.json();
+                if (data.status === 'success') {
+                    await loadData();
+                }
+            } catch(e) { alert("无法打开文件选择器，请检查后端控制台"); }
+        };
+
+        const selectAlbum = (album) => {
+            if (!album) return;
+            currentAlbum.value = album;
+            viewMode.value = 'album';
+            // Reset filters
+            filter.value.search = '';
+        };
+
+        const goHome = () => {
+            viewMode.value = 'home';
+            currentAlbum.value = null;
+        };
+        const hasActiveFilter = computed(() => {
+            return !!filter.value.search || !!filter.value.color || filter.value.minRating > 0;
+        });
+        const filteredPhotos = computed(() => {
+            let sourcePhotos = [];
+            if (viewMode.value === 'album' && currentAlbum.value) {
+                sourcePhotos = currentAlbum.value.photos;
+            } else if (viewMode.value === 'home') {
+                // 主页模式下，如果有搜索词，则搜索所有相册；否则为空（因为主页不展示所有图片）
+                if (hasActiveFilter.value) {
+                    sourcePhotos = flatAlbums.value.flatMap(album => album.photos);
+                } else {
+                    return [];
+                }
+
+            }
+            return sourcePhotos.filter(p => {
+                const matchRating = p.rating >= filter.value.minRating;
+                if (filter.value.minRating === 5 && p.rating !== 5) return false; // Strict 5 star
+                const matchColor = !filter.value.color || p.color === filter.value.color;
+                const s = filter.value.search.toLowerCase();
+                const matchSearch = !s || p.name.toLowerCase().includes(s) || (p.tags && p.tags.some(t=>t.includes(s))) || (p.description && p.description.includes(s));
+                return matchRating && matchColor && matchSearch;
+            });
+        });
+
+        const groupedPhotos = computed(() => {
+            const groups = {};
+            const sorted = [...filteredPhotos.value].sort((a, b) => {
+                const dateA = new Date(a.date);
+                const dateB = new Date(b.date);
+                if (dateA.getTime() !== dateB.getTime()) {
+                    return dateB - dateA; // 时间倒序
+                }
+                return a.name.localeCompare(b.name); // 同一天按名字排
+            });
+            sorted.forEach(p => {
+                if (!groups[p.date]) groups[p.date] = [];
+                groups[p.date].push(p);
+            });
+            return groups;
+        });
+
+        // --- 查看器逻辑 ---
+
+        const openViewer = (photo) => {
+            previewPhoto.value = photo;
+            imgLoading.value = true;
+            resetView();
+            nextTick(() => document.body.style.overflow = 'hidden');
+        };
+
+        const closeViewer = () => {
+            previewPhoto.value = null;
+            document.body.style.overflow = '';
+        };
+
+        const resetView = () => {
+            zoom.value = 1;
+            rotation.value = 0;
+            panX.value = 0;
+            panY.value = 0;
+        };
+
+        const currentPhotoIndex = computed(() => {
+            if (!previewPhoto.value) return -1;
+            let all = [];
+            Object.values(groupedPhotos.value).forEach(g => all.push(...g));
+            return all.findIndex(p => p.path === previewPhoto.value.path);
+        });
+
+        const hasNext = computed(() => currentPhotoIndex.value !== -1 && currentPhotoIndex.value < filteredPhotos.value.length - 1);
+        const hasPrev = computed(() => currentPhotoIndex.value > 0);
+
+        const nextPhoto = () => {
+            if (hasNext.value) {
+                let all = [];
+                Object.values(groupedPhotos.value).forEach(g => all.push(...g));
+                previewPhoto.value = all[currentPhotoIndex.value + 1];
+                imgLoading.value = true;
+                resetView();
+            }
+        };
+
+        const prevPhoto = () => {
+            if (hasPrev.value) {
+                let all = [];
+                Object.values(groupedPhotos.value).forEach(g => all.push(...g));
+                previewPhoto.value = all[currentPhotoIndex.value - 1];
+                imgLoading.value = true;
+                resetView();
+            }
+        };
+
+        // --- 拖拽与缩放 ---
+
+        const handleZoom = (e) => {
+            const delta = e.deltaY > 0 ? -0.1 : 0.1;
+            let newZoom = zoom.value + delta;
+            if (newZoom < 0.5) newZoom = 0.5;
+            if (newZoom > 5) newZoom = 5;
+            zoom.value = newZoom;
+        };
+
+        const startDrag = (e) => {
+            isDragging.value = true;
+            dragStart = { x: e.clientX - panX.value, y: e.clientY - panY.value };
+        };
+        const onDrag = (e) => {
+            if (!isDragging.value) return;
+            e.preventDefault();
+            panX.value = e.clientX - dragStart.x;
+            panY.value = e.clientY - dragStart.y;
+        };
+        const endDrag = () => {
+            isDragging.value = false;
+        };
+
+        // --- 数据更新 ---
+
+        const updateMeta = async (photo, field, value) => {
+            photo[field] = value;
+            await fetch('/api/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ path: photo.path, [field]: value })
+            });
+        };
+
+        const setAsCover = async (photo) => {
+            if (!currentAlbum.value) return;
+            currentAlbum.value.cover = photo.path;
+            await fetch('/api/set_cover', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ folder: currentAlbum.value.folder_path, photo_path: photo.path })
+            });
+            alert("已设为封面");
+        };
+
+        const ratePhoto = (p, r) => updateMeta(p, 'rating', p.rating === r ? 0 : r);
+        const colorPhoto = (p, c) => updateMeta(p, 'color', c);
+        const rotateRight = () => rotation.value += 90;
+
+        const handleViewerKey = (e) => {
+            if (e.target.tagName === 'TEXTAREA') return;
+            if (e.key === 'Escape') closeViewer();
+            if (e.key === 'ArrowRight') nextPhoto();
+            if (e.key === 'ArrowLeft') prevPhoto();
+        };
+
+        const toggleTheme = () => {
+            isDark.value = !isDark.value;
+            document.documentElement.classList.toggle('dark', isDark.value);
+        };
+        const toggleFilter = (t, v) => {
+            if (t==='color') filter.value.color = filter.value.color===v ? null : v;
+        };
+
+        onMounted(() => loadData());
+
+        return {
+            sidebarOpen, isDark, loading,
+            flatAlbums, folderTree, currentAlbum, viewMode,
+            filter, groupedPhotos, filteredPhotos,
+            previewPhoto, imgLoading, zoom, rotation, panX, panY, isDragging,
+
+            // Methods
+            openSystemPicker, selectAlbum, goHome,
+            openViewer, closeViewer, nextPhoto, prevPhoto, hasNext, hasPrev,
+            handleZoom, startDrag, onDrag, endDrag,
+            updateMeta, ratePhoto, colorPhoto, setAsCover, rotateRight,
+            toggleTheme, toggleFilter, handleViewerKey,removeCurrentAlbum,isEditingDesc, saveDescription,
+            rootAlbums,viewerBg, toggleViewerBg,resetView,hasActiveFilter
+        };
+    }
+}).mount('#app');
+</script>
+</body>
+</html>
