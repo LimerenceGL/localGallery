@@ -3,7 +3,7 @@ import sqlite3
 import datetime
 import json
 import threading
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,7 +17,7 @@ from tkinter import filedialog
 
 # --- 配置 ---
 DB_FILE = "metadata.db"
-
+CACHE_FILE = "scan_cache.json"
 app = FastAPI()
 
 app.add_middleware(
@@ -27,6 +27,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class ReorderRequest(BaseModel):
+    photo_paths: List[str]
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -74,7 +76,17 @@ def init_db():
                       color TEXT, tags TEXT, description TEXT, 
                       width INTEGER, height INTEGER, is_live INTEGER)''')
 
+    try:
+        c.execute("ALTER TABLE photos ADD COLUMN rank INTEGER DEFAULT 0")
+    except:
+        pass
 
+        # 确保建表语句也包含 rank
+    c.execute('''CREATE TABLE IF NOT EXISTS photos 
+                     (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
+                      color TEXT, tags TEXT, description TEXT, 
+                      width INTEGER, height INTEGER, is_live INTEGER, 
+                      rank INTEGER DEFAULT 0)''')
 
     conn.commit()
     conn.close()
@@ -202,8 +214,7 @@ def check_is_live(path):
         pass
 
     return 0
-@app.get("/api/scan")
-def scan_photos():
+def perform_scan_logic():
     root_dirs = get_root_dirs()
     conn = get_db_connection()
 
@@ -238,9 +249,8 @@ def scan_photos():
             for f in image_files:
                 full_path = os.path.normpath(os.path.join(root, f))
 
-                # 修改 SQL 查询，多查 width 和 height
                 row = conn.execute(
-                    "SELECT rating, color, tags, description, width, height, is_live FROM photos WHERE path=?",
+                    "SELECT rating, color, tags, description, width, height, is_live, rank FROM photos WHERE path=?",
                     (full_path,)).fetchone()
 
                 tags_list = []
@@ -283,6 +293,7 @@ def scan_photos():
                     "color": row['color'] if row else "none",
                     "tags": tags_list,
                     "description": row['description'] if row else "",
+                    "rank": row['rank'] if row else 0,
                     "is_live": is_live
                 })
 
@@ -315,10 +326,58 @@ def scan_photos():
                 "photos": album_photos,
                 "count": len(album_photos)
             })
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(all_galleries, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"Cache write error: {e}")
 
     conn.close()
     return all_galleries
 
+def background_scan_task():
+    print("开始后台扫描...")
+    perform_scan_logic()
+    print("后台扫描完成，缓存已更新")
+
+
+# 5. 重写 API 接口 scan_photos
+@app.get("/api/scan")
+def scan_photos(background_tasks: BackgroundTasks, force: bool = False):
+    """
+    1. 如果有缓存文件，直接返回缓存 (极快)。
+    2. 同时在后台启动扫描任务，更新缓存。
+    3. 如果没有缓存(第一次运行)，则同步扫描并返回。
+    """
+    # 如果强制刷新 或者 没有缓存文件，必须同步扫描
+    if force or not os.path.exists(CACHE_FILE):
+        return perform_scan_logic()
+
+    # 有缓存：先触发后台更新，然后立马返回旧数据
+    background_tasks.add_task(background_scan_task)
+
+    try:
+        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data
+    except:
+        # 缓存读取失败，降级为同步扫描
+        return perform_scan_logic()
+
+@app.post("/api/reorder")
+def reorder_photos(data: ReorderRequest):
+    try:
+        conn = get_db_connection()
+        # 批量更新 rank
+        # 为了性能，使用 executemany
+        params = [(i, path) for i, path in enumerate(data.photo_paths)]
+        conn.executemany("UPDATE photos SET rank=? WHERE path=?", params)
+        conn.commit()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Reorder error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/live_video")
 def get_live_video(path: str):
@@ -435,10 +494,20 @@ def set_album_cover(data: CoverUpdate):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/")
-async def read_index():
-    return FileResponse('index.html')
+@app.get("/{full_path:path}")
+async def serve_spa(full_path: str):
+    """
+    处理前端路由：
+    1. 如果请求的是存在的文件（比如 css, js, map），直接返回文件
+    2. 否则统一返回 index.html，让 Vue Router 接管
+    """
+    # 如果请求的是实际存在的文件（例如 index.html 本身，或者打包后的资源）
+    if os.path.exists(full_path) and os.path.isfile(full_path):
+        return FileResponse(full_path)
 
+    # 否则全部返回 index.html
+    # (记得用 resource_path 处理打包后的路径，如果你还没打包，直接用 'index.html')
+    return FileResponse('index.html')
 
 if __name__ == "__main__":
     import uvicorn

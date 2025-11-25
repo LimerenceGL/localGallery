@@ -2,3 +2,4 @@ __pycache__/
 .thumb_cache
 metadata.db
 .idea
+scan_cache.json

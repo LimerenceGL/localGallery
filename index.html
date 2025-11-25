@@ -6,6 +6,8 @@
     <title>晓彤的图库</title>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/vue-router@4/dist/vue-router.global.js"></script>
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -45,6 +47,17 @@
         /* 图片查看器拖拽 */
         .grabbing { cursor: grabbing; }
         .grab { cursor: grab; }
+        /* --- 新增：手动排序模式下的“伪瀑布流”网格 --- */
+        .manual-masonry {
+            display: grid;
+            grid-template-columns: repeat(1, 1fr);
+            grid-auto-rows: 10px; /* 关键：细粒度行高 */
+            gap: 1rem;
+        }
+        @media (min-width: 640px) { .manual-masonry { grid-template-columns: repeat(2, 1fr); } }
+        @media (min-width: 768px) { .manual-masonry { grid-template-columns: repeat(3, 1fr); } }
+        @media (min-width: 1024px) { .manual-masonry { grid-template-columns: repeat(4, 1fr); } }
+        @media (min-width: 1536px) { .manual-masonry { grid-template-columns: repeat(5, 1fr); } }
     </style>
 </head>
 <body class="bg-gray-100 dark:bg-gray-950 text-gray-800 dark:text-gray-200 font-sans h-screen flex overflow-hidden">
@@ -74,9 +87,12 @@
             </folder-tree>
         </div>
 
-        <div class="p-4 border-t border-gray-200 dark:border-gray-800 text-xs text-gray-500 flex justify-between">
+        <div class="p-4 border-t border-gray-200 dark:border-gray-800 text-xs text-gray-500 flex justify-between items-center">
              <span>{{ flatAlbums.length }} 个相册</span>
-             <button @click="openSystemPicker" class="hover:text-blue-500 font-bold">+ 添加目录</button>
+             <div class="flex gap-3">
+                 <button @click="forceRefresh" class="hover:text-blue-500" title="强制重新扫描硬盘">🔄</button>
+                 <button @click="openSystemPicker" class="hover:text-blue-500 font-bold">+ 添加目录</button>
+             </div>
         </div>
     </aside>
 
@@ -87,6 +103,27 @@
             </div>
 
             <div class="flex items-center gap-3">
+                <div v-if="viewMode === 'album'"
+                     class="flex items-center bg-gray-100 dark:bg-gray-800 p-1 rounded-lg border border-gray-200 dark:border-gray-700 mr-2">
+
+                    <button @click="sortMode = 'date'"
+                            class="px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-200 flex items-center gap-1.5"
+                            :class="sortMode === 'date'
+                                ? 'bg-white dark:bg-gray-700 shadow-sm text-gray-900 dark:text-white'
+                                : 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'">
+                        <span>📅</span>
+                        <span>日期</span>
+                    </button>
+
+                    <button @click="sortMode = 'manual'"
+                            class="px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-200 flex items-center gap-1.5"
+                            :class="sortMode === 'manual'
+                                ? 'bg-white dark:bg-gray-700 shadow-sm text-gray-900 dark:text-white'
+                                : 'text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200'">
+                        <span>🔀</span>
+                        <span>自定义</span>
+                    </button>
+                </div>
                 <button v-if="viewMode === 'album' && currentAlbum && currentAlbum.folder_path === currentAlbum.root_root"
                         @click="removeCurrentAlbum"
                         title="从图库移除此相册"
@@ -178,43 +215,78 @@
 
             </div>
 
+
             <div v-else-if="viewMode === 'album'">
-                <div v-if="filteredPhotos.length === 0" class="text-center py-20 text-gray-500">
-                    没有符合条件的照片
+                <div v-for="(group, groupName) in groupedPhotos" :key="groupName" class="mb-8">
+
+            <h3 v-if="sortMode === 'date'" class="text-lg font-bold text-gray-500 mb-4 sticky top-0 z-[5] py-2 bg-gray-50/90 dark:bg-black/90 backdrop-blur-sm">{{ groupName }}</h3>
+
+    <div v-if="sortMode === 'date'" class="masonry-columns">
+        <div v-for="photo in group" :key="photo.path"
+             class="masonry-item relative group rounded-lg overflow-hidden bg-gray-200 dark:bg-gray-800 cursor-pointer shadow-sm hover:shadow-lg transition-shadow"
+             @click="openViewer(photo)">
+
+            <img :src="`/api/image?path=${encodeURIComponent(photo.path)}&thumb=true`"
+                 loading="lazy"
+                 class="w-full h-auto block transform transition-transform duration-700 hover:scale-105">
+
+            <div v-if="photo.is_live" class="absolute top-2 right-2 bg-white/80 dark:bg-black/60 backdrop-blur-md rounded-full px-2 py-0.5 text-[10px] font-bold text-gray-800 dark:text-white shadow-sm flex items-center gap-1 z-10">
+                <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                LIVE
+            </div>
+
+            <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3 pointer-events-none">
+                <div v-if="photo.description" class="mb-2">
+                    <p class="text-xs text-white/90 font-medium line-clamp-2 leading-relaxed drop-shadow-md">
+                        {{ photo.description }}
+                    </p>
+                </div>
+                <div class="flex justify-between items-end">
+                    <div class="flex gap-1">
+                        <div v-if="photo.color && photo.color !== 'none'" :style="{backgroundColor: photo.color}" class="w-3 h-3 rounded-full border border-white/50 shadow-sm"></div>
+                    </div>
+                    <span v-if="photo.rating > 0" class="text-yellow-400 text-xs font-bold drop-shadow-sm">★{{ photo.rating }}</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div v-else class="manual-masonry">
+        <div v-for="(photo, index) in group" :key="photo.path"
+             class="manual-item relative group rounded-lg overflow-hidden bg-gray-200 dark:bg-gray-800 cursor-pointer shadow-sm hover:shadow-lg transition-shadow"
+             :draggable="true"
+             @dragstart="handleDragStart($event, photo, index)"
+             @dragover.prevent
+             @dragenter.prevent
+             @drop="handleDrop($event, photo, index)"
+             @dragend="handleDragEndNew"
+             @click="openViewer(photo)">
+
+            <div class="masonry-content">
+                <img :src="`/api/image?path=${encodeURIComponent(photo.path)}&thumb=true`"
+                     @load="resizeGridItem($event.target.closest('.manual-item'))"
+                     class="w-full h-auto block transform transition-transform duration-700 hover:scale-105">
+
+                <div v-if="photo.is_live" class="absolute top-2 right-2 bg-white/80 dark:bg-black/60 backdrop-blur-md rounded-full px-2 py-0.5 text-[10px] font-bold text-gray-800 dark:text-white shadow-sm flex items-center gap-1 z-10">
+                    <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
+                    LIVE
                 </div>
 
-                <div v-for="(group, date) in groupedPhotos" :key="date" class="mb-8">
-                    <h3 class="text-lg font-bold text-gray-500 mb-4 sticky top-0 z-[5] py-2 bg-gray-50/90 dark:bg-black/90 backdrop-blur-sm">{{ date }}</h3>
-
-                    <div class="masonry-columns">
-                        <div v-for="photo in group" :key="photo.path"
-                             class="masonry-item relative group rounded-lg overflow-hidden bg-gray-200 dark:bg-gray-800 cursor-pointer shadow-sm hover:shadow-lg transition-shadow"
-                             @click="openViewer(photo)">
-
-                            <img :src="`/api/image?path=${encodeURIComponent(photo.path)}&thumb=true`"
-                                 loading="lazy"
-                                 class="w-full h-auto block transform transition-transform duration-700 hover:scale-105">
-
-                            <div v-if="photo.is_live" class="absolute top-2 right-2 bg-white/80 dark:bg-black/60 backdrop-blur-md rounded-full px-2 py-0.5 text-[10px] font-bold text-gray-800 dark:text-white shadow-sm flex items-center gap-1 z-10">
-                                <span class="w-2 h-2 rounded-full bg-red-500 animate-pulse"></span>
-                                LIVE
-                            </div>
-                            <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3 pointer-events-none">
-
-                                <div v-if="photo.description" class="mb-2">
-                                    <p class="text-xs text-white/90 font-medium line-clamp-2 leading-relaxed drop-shadow-md">
-                                        {{ photo.description }}
-                                    </p>
-                                </div>
-                                <div class="flex justify-between items-end">
-                                    <div class="flex gap-1">
-                                        <div v-if="photo.color && photo.color !== 'none'" :style="{backgroundColor: photo.color}" class="w-3 h-3 rounded-full border border-white/50 shadow-sm"></div>
-                                        </div>
-                                    <span v-if="photo.rating > 0" class="text-yellow-400 text-xs font-bold drop-shadow-sm">★{{ photo.rating }}</span>
-                                </div>
-                            </div>
-                        </div>
+                <div class="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3 pointer-events-none">
+                    <div v-if="photo.description" class="mb-2">
+                        <p class="text-xs text-white/90 font-medium line-clamp-2 leading-relaxed drop-shadow-md">
+                            {{ photo.description }}
+                        </p>
                     </div>
+                    <div class="flex justify-between items-end">
+                        <div class="flex gap-1">
+                            <div v-if="photo.color && photo.color !== 'none'" :style="{backgroundColor: photo.color}" class="w-3 h-3 rounded-full border border-white/50 shadow-sm"></div>
+                        </div>
+                        <span v-if="photo.rating > 0" class="text-yellow-400 text-xs font-bold drop-shadow-sm">★{{ photo.rating }}</span>
+                    </div>
+                </div>
+            </div> </div>
+    </div>
                 </div>
             </div>
 
@@ -385,42 +457,37 @@
 </script>
 
 <script>
-const { createApp, ref, computed, onMounted, nextTick, reactive } = Vue;
+const { createApp, ref, computed, onMounted, nextTick, watch } = Vue;
+const { createRouter, createWebHistory, useRoute, useRouter } = VueRouter;
+const EmptyComponent = { template: '<div></div>' };
+// --- 1. 定义路由组件 (为了配合 Vue Router，我们需要简单的占位组件) ---
+// 其实我们是单页应用，可以直接都在 App 里处理，但定义路由可以让逻辑更清晰
+// 这里我们采用“根据路由参数同步状态”的策略，不强制拆分大组件，改动最小
+const routes = [
+    { path: '/', name: 'Home', component: EmptyComponent }, // <--- 加上 component
+    { path: '/album', name: 'Album', component: EmptyComponent }, // <--- 加上 component
+];
 
-// 递归组件定义
+const router = createRouter({
+    history: createWebHistory(), // 使用漂亮的 URL 模式 (不带 #)
+    routes,
+});
+
+// FolderTree 组件保持不变...
 const FolderTree = {
     name: 'FolderTree',
     template: '#folder-tree-template',
     props: ['node', 'currentPath'],
     emits: ['select'],
     setup(props, { emit }) {
-        // 默认不展开，除非是根目录或者当前路径包含在内(这需要更复杂的逻辑，暂时保持默认关闭或手动开启)
         const isOpen = ref(false);
         const hasChildren = computed(() => props.node.children && props.node.children.length > 0);
-
-        // 只有当 node.data 存在（即这是一个真实的包含图片的相册）且路径匹配时，才算“选中”
-        // 如果只是中间目录（没有图片），path 可能不匹配，或者 node.data 为 null
         const isSelected = computed(() => props.node.data && props.currentPath === props.node.path);
-
-        // 动作1：切换展开
-        const toggle = () => {
-            if (hasChildren.value) {
-                isOpen.value = !isOpen.value;
-            }
-        };
-
-        // 动作2：选中相册
+        const toggle = () => { if (hasChildren.value) isOpen.value = !isOpen.value; };
         const selectNode = () => {
-            // 只有当该节点有关联的相册数据时，才触发选中
-            // 如果是纯父级文件夹（只有子文件夹没有图片），点击文字可能不需要反应，或者可以设计为“也展开”
-            if (props.node.data) {
-                emit('select', props.node.data);
-            } else {
-                // 如果用户点击了没有图片的父目录名字，为了体验好，也可以帮他展开
-                toggle();
-            }
+            if (props.node.data) emit('select', props.node.data);
+            else toggle();
         };
-
         return { isOpen, hasChildren, isSelected, toggle, selectNode };
     }
 };
@@ -428,36 +495,121 @@ const FolderTree = {
 createApp({
     components: { FolderTree },
     setup() {
-        const flatAlbums = ref([]); // 后端返回的原始数据
-        const folderTree = ref([]); // 转换后的树形结构
+        const route = useRoute();
+        const router = useRouter();
+
+        // 核心数据
+        const flatAlbums = ref([]);
+        const folderTree = ref([]);
         const currentAlbum = ref(null);
-        const viewMode = ref('home'); // 'home' | 'album'
+        const loading = ref(false);
+        const isScanning = ref(false);
+
+        // UI 状态
         const sidebarOpen = ref(true);
         const isDark = ref(true);
-        const loading = ref(false);
-        const isEditingDesc = ref(false);
+
         // 预览器状态
-        const previewPhoto = ref(null);
+        const previewPhoto = ref(null); // 如果有值，显示大图蒙层
         const imgLoading = ref(false);
+        const showVideo = ref(false);
+        const isLivePlaying = ref(false);
+        const hasAutoPlayed = ref(false);
+        const liveVideoRef = ref(null);
+
+        // 视图控制 (View Transform)
         const zoom = ref(1);
         const rotation = ref(0);
         const panX = ref(0);
         const panY = ref(0);
         const isDragging = ref(false);
         const viewerBg = ref('black');
+        const sortMode = ref('date');
+        const dragSrcIndex = ref(-1);
         let dragStart = { x: 0, y: 0 };
-        const showVideo = ref(false);
-        const isLivePlaying = ref(false); // 控制视频层的透明度
-        const liveVideoRef = ref(null);   // 绑定 video DOM 元素
-        const filter = ref({ minRating: 0, color: null, search: '' });
-        const hasAutoPlayed = ref(false);
-        const toggleViewerBg = () => viewerBg.value = viewerBg.value === 'black' ? 'white' : 'black';
 
-        // --- 数据加载与树构建 ---
+        // 筛选与编辑
+        const filter = ref({ minRating: 0, color: null, search: '' });
+        const isEditingDesc = ref(false);
+
+        // --- 核心改动：根据路由计算 viewMode ---
+        const viewMode = computed(() => {
+            if (route.path === '/album') return 'album';
+            return 'home';
+        });
+
+        // --- 核心改动：监听路由变化，同步数据 ---
+        // 当 URL 变了 (用户点击后退、点击相册、刷新页面)，我们去 flatAlbums 里找对应的数据
+        watch(() => [route.query, flatAlbums.value], ([query, albums]) => {
+            if (albums.length === 0) return; // 数据还没加载完，先不管
+
+            // 1. 同步相册 (Current Album)
+            if (route.path === '/album' && query.path) {
+                const targetPath = query.path;
+                const found = albums.find(a => a.folder_path === targetPath);
+                if (found) {
+                    currentAlbum.value = found;
+                } else {
+                    // 路径不对，跳回主页
+                    // router.replace('/');
+                }
+            } else {
+                currentAlbum.value = null;
+            }
+
+            // 2. 同步照片预览 (Preview Photo)
+            // URL 示例: /album?path=...&photo=...
+            if (query.photo && currentAlbum.value) {
+                const photoPath = query.photo;
+                const foundPhoto = currentAlbum.value.photos.find(p => p.path === photoPath);
+                if (foundPhoto) {
+                    // 如果当前已经在预览这张，就不重置视图
+                    if (previewPhoto.value?.path !== foundPhoto.path) {
+                        openViewerInternal(foundPhoto);
+                    }
+                }
+            } else {
+                // 如果 URL 里没有 photo 参数，关闭预览器
+                if (previewPhoto.value) {
+                    closeViewerInternal();
+                }
+            }
+        }, { immediate: true, deep: true });
+
+
+        // --- 数据加载 ---
+        const buildTreeStructure = (albums) => {
+            // ... (保持原有的树构建逻辑不变) ...
+            const tree = [];
+            const nodeMap = {};
+            albums.forEach(album => {
+                const parts = album.rel_path === '.' ? [] : album.rel_path.split(/[\\/]/);
+                let pathKey = album.root_root;
+                let rootNode = tree.find(n => n.path === album.root_root);
+                if (!rootNode) {
+                    rootNode = { name: album.root_root.split(/[\\/]/).pop(), path: album.root_root, children: [], data: null };
+                    tree.push(rootNode);
+                }
+                if (parts.length === 0) { rootNode.data = album; rootNode.count = album.count; return; }
+                let parent = rootNode;
+                parts.forEach((part, index) => {
+                    pathKey += '/' + part;
+                    let existing = parent.children.find(c => c.name === part);
+                    if (!existing) {
+                        existing = { name: part, path: pathKey, children: [], data: null, count: 0 };
+                        parent.children.push(existing);
+                    }
+                    if (index === parts.length - 1) { existing.data = album; existing.count = album.count; }
+                    parent = existing;
+                });
+            });
+            folderTree.value = tree;
+        };
 
         const loadData = async () => {
             loading.value = true;
             try {
+                // 优先读缓存
                 const res = await fetch('/api/scan');
                 const data = await res.json();
                 flatAlbums.value = data || [];
@@ -466,233 +618,131 @@ createApp({
             finally { loading.value = false; }
         };
 
-        const buildTreeStructure = (albums) => {
-            // 将平铺的相册列表转换为树
-            // 算法：根据 root_root 和 rel_path
-            const tree = [];
-
-            // 1. 先把所有节点按路径放入 Map
-            const nodeMap = {};
-
-            albums.forEach(album => {
-                // 标准化路径
-                const parts = album.rel_path === '.' ? [] : album.rel_path.split(/[\\/]/);
-                let currentLevel = tree;
-                let pathKey = album.root_root; // 唯一键前缀
-
-                // 处理根目录节点
-                let rootNode = tree.find(n => n.path === album.root_root);
-                if (!rootNode) {
-                    rootNode = {
-                        name: album.root_root.split(/[\\/]/).pop(), // 显示名
-                        path: album.root_root,
-                        children: [],
-                        data: null // 根节点可能不是一个具体的相册（如果只有子文件夹有图片）
-                    };
-                    tree.push(rootNode);
-                }
-
-                // 如果是根目录本身的相册
-                if (parts.length === 0) {
-                    rootNode.data = album;
-                    rootNode.count = album.count;
-                    return;
-                }
-
-                // 处理子目录
-                let parent = rootNode;
-                parts.forEach((part, index) => {
-                    pathKey += '/' + part;
-                    let existing = parent.children.find(c => c.name === part);
-                    if (!existing) {
-                        existing = {
-                            name: part,
-                            path: pathKey, // 虚拟路径ID
-                            children: [],
-                            data: null,
-                            count: 0
-                        };
-                        parent.children.push(existing);
-                    }
-                    // 如果到了最后一级，关联相册数据
-                    if (index === parts.length - 1) {
-                        existing.data = album;
-                        existing.count = album.count;
-                    }
-                    parent = existing;
-                });
-            });
-
-            folderTree.value = tree;
-        };
-
-        const rootAlbums = computed(() => {
-            // 在主页显示的相册：所有根目录下的第一级相册或根目录本身
-            // 这里简单处理：显示所有 flatAlbums 中 rel_path 为 . 或者第一级的
-            // 或者直接显示 flatAlbums 里的每一个条目作为平铺展示
-            return flatAlbums.value;
-        });
-
-        const saveDescription = () => {
-            isEditingDesc.value = false;
-            // updateMeta 会自动发送请求，无需额外操作，input 的 @change 或 v-model 已经更新了 previewPhoto.description
-            // 但为了确保万无一失，可以在这里再次触发 updateMeta (可选)
-        };
-        const removeCurrentAlbum = async () => {
-            if (!currentAlbum.value) return;
-
-            // 二次确认，防止误删
-            if (!confirm(`确定要将 "${currentAlbum.value.name}" 从图库中移除吗？\n(注意：硬盘上的文件不会被删除)`)) {
-                return;
-            }
-
-            try {
-                // 调用后端 API 删除 root
-                const res = await fetch(`/api/roots?path=${encodeURIComponent(currentAlbum.value.folder_path)}`, {
-                    method: 'DELETE'
-                });
-                const data = await res.json();
-
-                if (data.status === 'success') {
-                    alert('相册已移除');
-                    // 重新加载数据并回到主页
-                    loadData();
-                    goHome();
-                }
-            } catch (e) {
-                alert('移除失败: ' + e);
-            }
-        };
-        // --- 核心操作 ---
-
-        const openSystemPicker = async () => {
-            try {
-                const res = await fetch('/api/pick_folder');
-                const data = await res.json();
-                if (data.status === 'success') {
-                    await loadData();
-                }
-            } catch(e) { alert("无法打开文件选择器，请检查后端控制台"); }
-        };
+        // --- 交互动作 (改为操作 Router) ---
 
         const selectAlbum = (album) => {
             if (!album) return;
-            currentAlbum.value = album;
-            viewMode.value = 'album';
-            // Reset filters
+            // 清空搜索
             filter.value.search = '';
+            // 路由跳转：带上 path 参数
+            router.push({
+                name: 'Album',
+                query: { path: album.folder_path }
+            });
         };
 
         const goHome = () => {
-            viewMode.value = 'home';
-            currentAlbum.value = null;
+            router.push('/');
         };
-        const hasActiveFilter = computed(() => {
-            return !!filter.value.search || !!filter.value.color || filter.value.minRating > 0;
-        });
-        const filteredPhotos = computed(() => {
-            let sourcePhotos = [];
-            if (viewMode.value === 'album' && currentAlbum.value) {
-                sourcePhotos = currentAlbum.value.photos;
-            } else if (viewMode.value === 'home') {
-                // 主页模式下，如果有搜索词，则搜索所有相册；否则为空（因为主页不展示所有图片）
-                if (hasActiveFilter.value) {
-                    sourcePhotos = flatAlbums.value.flatMap(album => album.photos);
-                } else {
-                    return [];
-                }
-
-            }
-            return sourcePhotos.filter(p => {
-                const matchRating = p.rating >= filter.value.minRating;
-                if (filter.value.minRating === 5 && p.rating !== 5) return false; // Strict 5 star
-                const matchColor = !filter.value.color || p.color === filter.value.color;
-                const s = filter.value.search.toLowerCase();
-                const matchSearch = !s || p.name.toLowerCase().includes(s) || (p.tags && p.tags.some(t=>t.includes(s))) || (p.description && p.description.includes(s));
-                return matchRating && matchColor && matchSearch;
-            });
-        });
-
-        const groupedPhotos = computed(() => {
-            const groups = {};
-            const sorted = [...filteredPhotos.value].sort((a, b) => {
-                const dateA = new Date(a.date);
-                const dateB = new Date(b.date);
-                if (dateA.getTime() !== dateB.getTime()) {
-                    return dateB - dateA; // 时间倒序
-                }
-                return a.name.localeCompare(b.name); // 同一天按名字排
-            });
-            sorted.forEach(p => {
-                if (!groups[p.date]) groups[p.date] = [];
-                groups[p.date].push(p);
-            });
-            return groups;
-        });
-
-        // --- 查看器逻辑 ---
 
         const openViewer = (photo) => {
+            // 如果在主页 (viewMode 为 home)，我们需要先找到这张图属于哪个相册
+            if (viewMode.value === 'home') {
+                // 在所有相册里找一张包含此 photo.path 的相册
+                const targetAlbum = flatAlbums.value.find(a =>
+                    a.photos.some(p => p.path === photo.path)
+                );
+
+                if (targetAlbum) {
+                    // 跳转到相册视图，并带上 photo 参数
+                    router.push({
+                        name: 'Album',
+                        query: {
+                            path: targetAlbum.folder_path,
+                            photo: photo.path
+                        }
+                    });
+                    return; // 结束，交给路由监听器去处理
+                }
+            }
+
+            // 正常逻辑：已经在相册里了，直接加 photo 参数
+            router.push({
+                query: {
+                    ...route.query,
+                    photo: photo.path
+                }
+            });
+        };
+        // --- 新增：动态计算 Grid 高度 ---
+
+        // 1. 重新计算所有卡片高度
+        const resizeAllGridItems = () => {
+            if (sortMode.value !== 'manual') return;
+
+            // 找到所有卡片
+            const allItems = document.getElementsByClassName('manual-item');
+            for (let i = 0; i < allItems.length; i++) {
+                resizeGridItem(allItems[i]);
+            }
+        };
+        // 2. 计算单个卡片高度
+        const resizeGridItem = (item) => {
+            const content = item.querySelector('.masonry-content');
+            if (!content) return;
+
+            const rowHeight = 10; // CSS grid-auto-rows: 10px
+            const rowGap = 16;    // CSS gap: 1rem = 16px (默认)
+
+            // 获取内容实际高度
+            const contentHeight = content.getBoundingClientRect().height;
+
+            // 🟥 修正前的错误公式：
+            // const span = Math.ceil((contentHeight + rowGap) / rowHeight);
+
+            // 🟩 修正后的正确公式：
+            // 分母应该是 (行高 + 间距)，因为每增加一行，实际上增加了 10px内容 + 16px间距
+            const span = Math.ceil((contentHeight + rowGap) / (rowHeight + rowGap));
+
+            item.style.gridRowEnd = `span ${span}`;
+        };
+        // 3. 监听窗口变化
+        window.addEventListener('resize', resizeAllGridItems);
+
+        // 4. 监听排序模式切换，切到 manual 时计算一次
+        watch(sortMode, (val) => {
+            if (val === 'manual') {
+                // 等待 DOM 渲染完再计算
+                nextTick(() => {
+                    // 稍微延时一点，确保图片开始占位
+                    setTimeout(resizeAllGridItems, 100);
+                    // 再次延时，确保图片加载
+                    setTimeout(resizeAllGridItems, 500);
+                });
+            }
+        });
+
+
+
+        const closeViewer = () => {
+            // 关闭大图：去掉 photo 参数，或者是后退一步 (router.back())
+            // 使用 router.push 替换当前 query 更可控
+            const newQuery = { ...route.query };
+            delete newQuery.photo;
+            router.push({ query: newQuery });
+        };
+
+        // 内部函数：仅处理 UI 状态，不涉及路由 (供 watch 调用)
+        const openViewerInternal = (photo) => {
             previewPhoto.value = photo;
             imgLoading.value = true;
+            // 重置 Live 状态
             isLivePlaying.value = false;
-            hasAutoPlayed.value = false; // <--- 重置
-
+            hasAutoPlayed.value = false;
             resetView();
             nextTick(() => document.body.style.overflow = 'hidden');
         };
 
-        const closeViewer = () => {
+        const closeViewerInternal = () => {
             previewPhoto.value = null;
             document.body.style.overflow = '';
         };
-// --- 新增：处理视频加载完成 ---
-        const handleVideoLoad = () => {
-            if (!previewPhoto.value?.is_live) return;
 
-            // 如果已经自动播放过了，就直接停止，防止死循环
-            if (hasAutoPlayed.value) return;
-
-            setTimeout(() => {
-                // 双重检查
-                if (!hasAutoPlayed.value) {
-                    playLiveOneShot();
-                    hasAutoPlayed.value = true; // <--- 标记已播放
-                }
-            }, 200);
-        };
-
-        // --- 新增：播放一次的逻辑 ---
-        const playLiveOneShot = () => {
-            const v = liveVideoRef.value;
-            if (v) {
-                // 设为可见
-                isLivePlaying.value = true;
-                v.currentTime = 0;
-                v.muted = true; // ⚠️ 浏览器通常禁止未静音的自动播放，为了丝滑建议静音，或者由用户交互触发
-
-                v.play().catch(e => {
-                    console.log("Autoplay prevented:", e);
-                    isLivePlaying.value = false;
-                });
-            }
-        };
-
-        // --- 新增：视频播放结束 ---
-        const handleVideoEnded = () => {
-            // 播放结束，渐隐视频，显示底下的图片
-            isLivePlaying.value = false;
-        };
-        const resetView = () => {
-            zoom.value = 1;
-            rotation.value = 0;
-            panX.value = 0;
-            panY.value = 0;
-        };
-
+        // 切换图片：直接修改 URL 的 photo 参数
         const currentPhotoIndex = computed(() => {
             if (!previewPhoto.value) return -1;
             let all = [];
+            // 注意：这里依赖 groupedPhotos，确保它计算正确
             Object.values(groupedPhotos.value).forEach(g => all.push(...g));
             return all.findIndex(p => p.path === previewPhoto.value.path);
         });
@@ -704,11 +754,8 @@ createApp({
             if (hasNext.value) {
                 let all = [];
                 Object.values(groupedPhotos.value).forEach(g => all.push(...g));
-                previewPhoto.value = all[currentPhotoIndex.value + 1];
-                imgLoading.value = true;
-                showVideo.value = false;
-                hasAutoPlayed.value = false;
-                resetView();
+                const nextP = all[currentPhotoIndex.value + 1];
+                openViewer(nextP); // 这会触发 router.push -> watch -> openViewerInternal
             }
         };
 
@@ -716,63 +763,189 @@ createApp({
             if (hasPrev.value) {
                 let all = [];
                 Object.values(groupedPhotos.value).forEach(g => all.push(...g));
-                previewPhoto.value = all[currentPhotoIndex.value - 1];
-                imgLoading.value = true;
-                showVideo.value = false;
-                resetView();
+                const prevP = all[currentPhotoIndex.value - 1];
+                openViewer(prevP);
             }
         };
 
-        // --- 拖拽与缩放 ---
+        // --- 其他逻辑 (保持不变) ---
 
+        const removeCurrentAlbum = async () => {
+            if (!currentAlbum.value) return;
+            if (!confirm(`确定要移除 "${currentAlbum.value.name}" 吗?`)) return;
+            try {
+                const res = await fetch(`/api/roots?path=${encodeURIComponent(currentAlbum.value.folder_path)}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    await loadData(); // 重新加载数据
+                    goHome(); // 路由回主页
+                }
+            } catch (e) { alert('移除失败: ' + e); }
+        };
+
+        const rootAlbums = computed(() => flatAlbums.value);
+
+        const hasActiveFilter = computed(() => !!filter.value.search || !!filter.value.color || filter.value.minRating > 0);
+
+        const filteredPhotos = computed(() => {
+            let sourcePhotos = [];
+            if (viewMode.value === 'album' && currentAlbum.value) {
+                sourcePhotos = currentAlbum.value.photos;
+            } else if (viewMode.value === 'home') {
+                if (hasActiveFilter.value) {
+                    sourcePhotos = flatAlbums.value.flatMap(album => album.photos);
+                } else { return []; }
+            }
+            return sourcePhotos.filter(p => {
+                const matchRating = p.rating >= filter.value.minRating;
+                if (filter.value.minRating === 5 && p.rating !== 5) return false;
+                const matchColor = !filter.value.color || p.color === filter.value.color;
+                const s = filter.value.search.toLowerCase();
+                const matchSearch = !s || p.name.toLowerCase().includes(s) || (p.tags && p.tags.some(t=>t.includes(s))) || (p.description && p.description.includes(s));
+                return matchRating && matchColor && matchSearch;
+            });
+        });
+
+        const groupedPhotos = computed(() => {
+            // 模式 A: 手动排序 -> 返回一个扁平的大组，方便 Grid 布局
+            if (sortMode.value === 'manual') {
+                const sorted = [...filteredPhotos.value].sort((a, b) => {
+                    // 按 rank 升序，如果没有 rank 则按原来的逻辑
+                    if (a.rank !== b.rank) return a.rank - b.rank;
+                    // Fallback
+                    const dateA = new Date(a.date);
+                    const dateB = new Date(b.date);
+                    return dateB - dateA;
+                });
+                return { '自定义排序': sorted }; // 返回单个 Key
+            }
+
+            // 模式 B: 日期分组 (默认)
+            const groups = {};
+            const sorted = [...filteredPhotos.value].sort((a, b) => {
+                const dateA = new Date(a.date);
+                const dateB = new Date(b.date);
+                if (dateA.getTime() !== dateB.getTime()) {
+                    return dateB - dateA;
+                }
+                return a.name.localeCompare(b.name);
+            });
+            sorted.forEach(p => {
+                if (!groups[p.date]) groups[p.date] = [];
+                groups[p.date].push(p);
+            });
+            return groups;
+        });
+ // --- 3. 拖拽逻辑 ---
+
+        const handleDragStart = (e, photo, index) => {
+            if (sortMode.value !== 'manual') return;
+            dragSrcIndex.value = index;
+            e.dataTransfer.effectAllowed = 'move';
+            e.target.style.opacity = '0.5';
+        };
+
+        // 1. 先定义 handleDragEnd
+        const handleDragEnd = (e) => {
+            e.target.style.opacity = '1';
+            dragSrcIndex.value = -1;
+        };
+
+        // 2. 然后再定义 handleDragEndNew (它引用了上面的 handleDragEnd)
+        // 注意：这里不需要 handleDragEndOriginal 这种中间变量了，直接调用上面的即可
+        const handleDragEndNew = (e) => {
+            handleDragEnd(e);     // 执行清理
+            resizeAllGridItems(); // 重新计算布局
+        };
+
+        const handleDrop = async (e, targetPhoto, targetIndex) => {
+            // ... (handleDrop 的内容保持不变) ...
+             e.preventDefault();
+            if (sortMode.value !== 'manual' || dragSrcIndex.value === -1) return;
+            if (dragSrcIndex.value === targetIndex) return;
+
+            const list = groupedPhotos.value['自定义排序'];
+            const newList = [...list];
+            const [movedItem] = newList.splice(dragSrcIndex.value, 1);
+            newList.splice(targetIndex, 0, movedItem);
+
+            newList.forEach((p, idx) => p.rank = idx);
+
+            const photoPaths = newList.map(p => p.path);
+            try {
+                await fetch('/api/reorder', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ photo_paths: photoPaths })
+                });
+            } catch (err) {
+                alert("排序保存失败");
+            }
+        };
+        // 辅助功能
+        const handleVideoLoad = () => {
+            if (!previewPhoto.value?.is_live || hasAutoPlayed.value) return;
+            setTimeout(() => { if (!hasAutoPlayed.value) { playLiveOneShot(); hasAutoPlayed.value = true; } }, 200);
+        };
+        const playLiveOneShot = () => {
+            const v = liveVideoRef.value;
+            if (v) { isLivePlaying.value = true; v.currentTime = 0; v.muted = true; v.play().catch(()=>{}); }
+        };
+        const handleVideoEnded = () => { isLivePlaying.value = false; };
+
+        const resetView = () => { zoom.value = 1; rotation.value = 0; panX.value = 0; panY.value = 0; };
         const handleZoom = (e) => {
             const delta = e.deltaY > 0 ? -0.1 : 0.1;
             let newZoom = zoom.value + delta;
-            if (newZoom < 0.5) newZoom = 0.5;
-            if (newZoom > 5) newZoom = 5;
+            if (newZoom < 0.5) newZoom = 0.5; if (newZoom > 5) newZoom = 5;
             zoom.value = newZoom;
         };
-
-        const startDrag = (e) => {
-            isDragging.value = true;
-            dragStart = { x: e.clientX - panX.value, y: e.clientY - panY.value };
-        };
-        const onDrag = (e) => {
-            if (!isDragging.value) return;
-            e.preventDefault();
-            panX.value = e.clientX - dragStart.x;
-            panY.value = e.clientY - dragStart.y;
-        };
-        const endDrag = () => {
-            isDragging.value = false;
-        };
-
-        // --- 数据更新 ---
+        const startDrag = (e) => { isDragging.value = true; dragStart = { x: e.clientX - panX.value, y: e.clientY - panY.value }; };
+        const onDrag = (e) => { if (!isDragging.value) return; e.preventDefault(); panX.value = e.clientX - dragStart.x; panY.value = e.clientY - dragStart.y; };
+        const endDrag = () => { isDragging.value = false; };
 
         const updateMeta = async (photo, field, value) => {
             photo[field] = value;
-            await fetch('/api/update', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ path: photo.path, [field]: value })
-            });
+            await fetch('/api/update', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ path: photo.path, [field]: value }) });
         };
-
         const setAsCover = async (photo) => {
             if (!currentAlbum.value) return;
             currentAlbum.value.cover = photo.path;
-            await fetch('/api/set_cover', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ folder: currentAlbum.value.folder_path, photo_path: photo.path })
-            });
+            await fetch('/api/set_cover', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ folder: currentAlbum.value.folder_path, photo_path: photo.path }) });
             alert("已设为封面");
+        };
+        const openSystemPicker = async () => {
+            try {
+                const res = await fetch('/api/pick_folder');
+                const data = await res.json();
+                if (data.status === 'success') {
+                    // 添加完文件夹，强制刷新一下数据
+                    const res2 = await fetch('/api/scan?force=true');
+                    const data2 = await res2.json();
+                    flatAlbums.value = data2 || [];
+                    buildTreeStructure(flatAlbums.value);
+                }
+            } catch(e) { alert("无法打开文件选择器"); }
+        };
+        const forceRefresh = async () => {
+            if(confirm("确定要强制重新扫描硬盘吗？")) {
+                loading.value = true;
+                try {
+                    const res = await fetch('/api/scan?force=true');
+                    const data = await res.json();
+                    flatAlbums.value = data || [];
+                    buildTreeStructure(flatAlbums.value);
+                } finally { loading.value = false; }
+            }
         };
 
         const ratePhoto = (p, r) => updateMeta(p, 'rating', p.rating === r ? 0 : r);
         const colorPhoto = (p, c) => updateMeta(p, 'color', c);
         const rotateRight = () => rotation.value += 90;
-
+        const toggleTheme = () => { isDark.value = !isDark.value; document.documentElement.classList.toggle('dark', isDark.value); };
+        const toggleFilter = (t, v) => { if (t==='color') filter.value.color = filter.value.color===v ? null : v; };
+        const toggleViewerBg = () => viewerBg.value = viewerBg.value === 'black' ? 'white' : 'black';
+        const saveDescription = () => { isEditingDesc.value = false; };
         const handleViewerKey = (e) => {
             if (e.target.tagName === 'TEXTAREA') return;
             if (e.key === 'Escape') closeViewer();
@@ -780,34 +953,33 @@ createApp({
             if (e.key === 'ArrowLeft') prevPhoto();
         };
 
-        const toggleTheme = () => {
-            isDark.value = !isDark.value;
-            document.documentElement.classList.toggle('dark', isDark.value);
-        };
-        const toggleFilter = (t, v) => {
-            if (t==='color') filter.value.color = filter.value.color===v ? null : v;
-        };
-
         onMounted(() => loadData());
 
+        // 这里的 use 必须在 createRouter 之后，但因为我们是 CDN 引入且混合写，
+        // 我们直接在 mount 时挂载 router
+
         return {
-            sidebarOpen, isDark, loading,
+            sidebarOpen, isDark, loading, isScanning,
             flatAlbums, folderTree, currentAlbum, viewMode,
             filter, groupedPhotos, filteredPhotos,
             previewPhoto, imgLoading, zoom, rotation, panX, panY, isDragging,
+            showVideo, isLivePlaying, liveVideoRef, viewerBg, hasActiveFilter, isEditingDesc,
 
-            // Methods
-            openSystemPicker, selectAlbum, goHome,
+            openSystemPicker, selectAlbum, goHome, forceRefresh,
             openViewer, closeViewer, nextPhoto, prevPhoto, hasNext, hasPrev,
             handleZoom, startDrag, onDrag, endDrag,
             updateMeta, ratePhoto, colorPhoto, setAsCover, rotateRight,
-            toggleTheme, toggleFilter, handleViewerKey,removeCurrentAlbum,isEditingDesc, saveDescription,
-            rootAlbums,viewerBg, toggleViewerBg,resetView,hasActiveFilter,showVideo,
-            isLivePlaying, liveVideoRef, handleVideoLoad, handleVideoEnded, playLiveOneShot,
-            hasAutoPlayed
+            toggleTheme, toggleFilter, handleViewerKey, removeCurrentAlbum,
+            saveDescription, toggleViewerBg, resetView,
+            handleVideoLoad, handleVideoEnded, playLiveOneShot, rootAlbums,
+            sortMode,resizeGridItem,
+            handleDragStart, handleDrop,
+            handleDragEndNew
         };
     }
-}).mount('#app');
+})
+.use(router) // ⚠️ 记得在这里挂载 router
+.mount('#app');
 </script>
 </body>
 </html>
