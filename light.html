@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <title>3D 专业布光 - 最终完美版 (Sketchfab支持)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: "Microsoft YaHei", sans-serif; }
+        
+        /* 加载界面样式优化 */
+        #loading { 
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            text-align: center; color: white; background: rgba(20,20,20,0.9); padding: 40px; border-radius: 8px;
+            pointer-events: none; z-index: 100; border: 1px solid #444; box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            transition: opacity 0.3s;
+        }
+        
+        #drop-zone {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0, 100, 255, 0.2); border: 5px dashed #0088ff; box-sizing: border-box;
+            display: none; justify-content: center; align-items: center;
+            color: white; font-size: 24px; font-weight: bold; pointer-events: none; z-index: 200;
+        }
+
+        #info { 
+            position: absolute; top: 10px; width: 100%; text-align: center; color: #666; 
+            pointer-events: none; user-select: none; font-size: 14px;
+        }
+        
+        .reset-btn {
+            pointer-events: auto; cursor: pointer; color: #ff5555; text-decoration: underline; margin-left: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <h3 id="load-text">正在初始化引擎...</h3>
+        <div style="font-size:12px; color:#888; margin-top:10px;">首次加载需要下载 Draco 解码器，请稍候</div>
+    </div>
+    
+    <div id="drop-zone">释放鼠标以加载模型</div>
+    
+    <div id="info">
+        左键旋转 | 右键平移 | 拖入 Sketchfab 模型 (.glb)
+        <span class="reset-btn" onclick="resetApp()">[重置所有设置]</span>
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js'; // 引入压缩解码器
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+        const SAVE_KEY = 'studio-lighting-v3-stable';
+
+        // --- 1. 稳健的配置加载系统 ---
+        // 降低了默认曝光，调整了灯光比例
+        const defaultConfig = {
+            camera: { x: 0, y: 0, z: 12, tx: 0, ty: 0, tz: 0 },
+            exposure: 0.5, // 【修复】默认曝光降低，防止过曝
+            skin: { roughness: 0.5, sheen: 1.0, clearcoat: 0.1 },
+            lights: {
+                '主光 (Key)': { on: true, color: 0xffeebb, intensity: 200, angle: 45, height: 2, dist: 5, shadowRadius: 5 },
+                '辅光 (Fill)': { on: true, color: 0xffffff, intensity: 30, angle: -45, height: 0, dist: 6, shadowRadius: 5 },
+                '轮廓光 (Rim)': { on: true, color: 0xaaaaff, intensity: 150, angle: -140, height: 4, dist: 4, shadowRadius: 2 }
+            }
+        };
+
+        function loadConfig() {
+            try {
+                const saved = localStorage.getItem(SAVE_KEY);
+                if (saved) {
+                    const parsed = JSON.parse(saved);
+                    // 简单的校验，防止坏数据导致死循环
+                    if (!parsed.lights || !parsed.camera) throw new Error("Config corrupted");
+                    // 深度合并
+                    return { 
+                        ...defaultConfig, 
+                        ...parsed, 
+                        lights: { ...defaultConfig.lights, ...parsed.lights },
+                        camera: { ...defaultConfig.camera, ...parsed.camera }
+                    };
+                }
+            } catch (e) {
+                console.warn("配置损坏，已重置默认设置");
+                localStorage.removeItem(SAVE_KEY);
+            }
+            return defaultConfig;
+        }
+
+        const config = loadConfig();
+
+        // 供 HTML 按钮调用的重置函数
+        window.resetApp = function() {
+            if(confirm("确定要重置所有灯光和相机位置吗？")) {
+                localStorage.removeItem(SAVE_KEY);
+                location.reload();
+            }
+        };
+
+        function saveConfig() {
+            localStorage.setItem(SAVE_KEY, JSON.stringify(config));
+        }
+        
+
+        const skinInstances = []; 
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);// 近乎纯黑
+        
+        const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.VSMShadowMap; 
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        // 2. 修改：默认曝光降低，让黑色更纯净
+        renderer.toneMappingExposure = config.exposure || 0.5; 
+        document.body.appendChild(renderer.domElement);
+
+        const pmremGenerator = new THREE.PMREMGenerator(renderer);
+        // 3. 修改：生成的环境光不再直接作为 scene.environment，以此来手动控制强度
+        const envTexture = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
+        scene.environment = envTexture;
+        
+        // 如果你的 Three.js 版本支持 (r160+)，这行代码可以控制环境光亮度
+        // 如果不支持，画面依然会有点亮，需要靠调节曝光解决
+        scene.environmentIntensity = 0.1; // 极低的环境光，保证关灯就是黑的
+
+        // --- 3. 相机系统 ---
+        const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(config.camera.x, config.camera.y, config.camera.z);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.target.set(config.camera.tx, config.camera.ty, config.camera.tz);
+        
+        controls.addEventListener('end', () => {
+            config.camera.x = camera.position.x;
+            config.camera.y = camera.position.y;
+            config.camera.z = camera.position.z;
+            config.camera.tx = controls.target.x;
+            config.camera.ty = controls.target.y;
+            config.camera.tz = controls.target.z;
+            saveConfig();
+        });
+
+        // --- 4. 灯光系统 ---
+        const lights = {};
+        const sphereGeo = new THREE.SphereGeometry(0.1, 16, 16);
+
+        function createLight(name, params) {
+            const pivot = new THREE.Object3D();
+            scene.add(pivot);
+
+            const light = new THREE.SpotLight(params.color, params.intensity);
+            light.penumbra = 1.0;
+            light.angle = Math.PI / 4;
+            light.decay = 2;
+            light.distance = 50;
+            light.castShadow = true;
+            // 解决黑斑问题
+            light.shadow.bias = -0.0001;
+            light.shadow.normalBias = 0.05; 
+            light.shadow.radius = params.shadowRadius;
+            light.shadow.blurSamples = 25;
+            light.shadow.mapSize.set(2048, 2048);
+
+            light.position.set(0, params.height, params.dist);
+            pivot.add(light);
+            light.target.position.set(0,0,0);
+            pivot.add(light.target);
+            pivot.rotation.y = params.angle * (Math.PI / 180);
+
+            // 指示灯泡
+            const bulb = new THREE.Mesh(sphereGeo, new THREE.MeshBasicMaterial({ color: params.color }));
+            bulb.position.copy(light.position);
+            pivot.add(bulb);
+
+            lights[name] = { light, pivot, bulb, params };
+            return light;
+        }
+
+        Object.keys(config.lights).forEach(key => createLight(key, config.lights[key]));
+
+        // --- 5. 模型加载系统 (含 Draco 支持) ---
+        // 配置 Draco 解码器路径 (使用 CDN)
+        const dracoLoader = new DRACOLoader();
+        dracoLoader.setDecoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/');
+        
+        const loader = new GLTFLoader();
+        loader.setDRACOLoader(dracoLoader); // 【核心修复】挂载解码器
+
+        let currentModel = null;
+        const defaultSkinMat = new THREE.MeshPhysicalMaterial({
+            color: 0xffdec7, roughness: config.skin.roughness, metalness: 0.0,
+            specularIntensity: 0.5, sheen: config.skin.sheen, sheenColor: 0xffeaea,
+            clearcoat: config.skin.clearcoat, clearcoatRoughness: 0.3, side: THREE.DoubleSide
+        });
+
+        function updateLoading(msg, show=true) {
+            const el = document.getElementById('loading');
+            document.getElementById('load-text').innerText = msg;
+            el.style.opacity = show ? 1 : 0;
+            el.style.pointerEvents = show ? 'auto' : 'none';
+        }
+
+        // --- [修改处 2] 模型加载逻辑修复 ---
+
+        // --- [修复版] 模型加载逻辑：支持透明贴图与二次元风格 ---
+
+        // --- [最终稳妥版] 模型加载：完全继承原模型设置 ---
+
+        // --- [最终修复版] 模型加载：安全搬运属性，杜绝报错 ---
+
+        function loadModel(url, isNewFile = false) {
+            updateLoading("正在解析 3D 模型...", true);
+            
+            // 清空旧的材质引用
+            skinInstances.length = 0; 
+
+            loader.load(url, (gltf) => {
+                if (currentModel) scene.remove(currentModel);
+                
+                const root = gltf.scene;
+                
+                root.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+
+                        const oldMat = child.material;
+
+                        // 1. 创建一个新的物理材质，准备接收数据
+                        const newMat = new THREE.MeshPhysicalMaterial({
+                            side: THREE.DoubleSide, // 强制双面，防止头发消失
+                            envMapIntensity: 1.0    // 确保环境光正常
+                        });
+
+                        // 2. 【安全搬运】手动复制核心属性，不使用 .copy() 以防止报错
+                        
+                        // --- 基础颜色与贴图 ---
+                        if (oldMat.map) newMat.map = oldMat.map;
+                        if (oldMat.color) newMat.color.copy(oldMat.color);
+                        
+                        // --- 法线与细节 ---
+                        if (oldMat.normalMap) {
+                            newMat.normalMap = oldMat.normalMap;
+                            // 安全复制法线强度，如果原材质没有就默认 (1,1)
+                            if (oldMat.normalScale) newMat.normalScale.copy(oldMat.normalScale);
+                        }
+                        
+                        // --- 粗糙度与金属度 ---
+                        if (oldMat.roughnessMap) newMat.roughnessMap = oldMat.roughnessMap;
+                        if (oldMat.metalnessMap) newMat.metalnessMap = oldMat.metalnessMap;
+                        // 如果有数值设置，也保留
+                        if (oldMat.roughness !== undefined) newMat.roughness = oldMat.roughness;
+                        if (oldMat.metalness !== undefined) newMat.metalness = oldMat.metalness;
+
+                        // --- 透明度与混合模式 (最关键的部分) ---
+                        // 完美继承原模型的透明设置
+                        newMat.transparent = oldMat.transparent;
+                        newMat.opacity = oldMat.opacity;
+                        newMat.alphaMap = oldMat.alphaMap;
+                        newMat.alphaTest = oldMat.alphaTest; // 继承原作者的边缘切割设置
+                        
+                        // --- 自发光 (如果有) ---
+                        if (oldMat.emissiveMap) {
+                            newMat.emissiveMap = oldMat.emissiveMap;
+                            newMat.emissive.copy(oldMat.emissive);
+                            newMat.emissiveIntensity = oldMat.emissiveIntensity;
+                        }
+
+                        // 3. 应用新材质
+                        child.material = newMat;
+                        skinInstances.push(newMat);
+                    }
+                });
+                
+                // --- 缩放与位置校正 (保持不变) ---
+                currentModel = root;
+                scene.add(root);
+
+                const box = new THREE.Box3().setFromObject(root);
+                const size = box.getSize(new THREE.Vector3());
+                const center = box.getCenter(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const scaleFactor = 4.5 / maxDim;
+                root.scale.multiplyScalar(scaleFactor);
+                box.setFromObject(root);
+                box.getCenter(center);
+                root.position.sub(center);
+
+                if (isNewFile) {
+                    controls.target.set(0, 0, 0);
+                    camera.position.set(0, 0, 10);
+                    camera.lookAt(0, 0, 0);
+                    controls.update();
+                    config.camera.x = 0; config.camera.y = 0; config.camera.z = 10;
+                    saveConfig();
+                }
+                updateLoading("完成", false);
+                if (isNewFile) URL.revokeObjectURL(url);
+
+            }, (xhr) => {}, (err) => {
+                console.error(err);
+                alert("加载失败：模型数据结构异常，请查看控制台。");
+                updateLoading("加载失败", false);
+            });
+        }
+
+        // 初始加载 Lee 作为演示
+        loadModel('woman_head.glb');
+
+        // --- 6. 拖拽交互 ---
+        const dropZone = document.getElementById('drop-zone');
+        window.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.display = 'flex'; });
+        window.addEventListener('dragleave', (e) => { e.preventDefault(); if (!e.relatedTarget) dropZone.style.display = 'none'; });
+        window.addEventListener('drop', (e) => {
+            e.preventDefault(); 
+            dropZone.style.display = 'none';
+            const file = e.dataTransfer.files[0];
+            if (file) {
+                const url = URL.createObjectURL(file);
+                loadModel(url, true);
+            }
+        });
+
+        // --- 7. GUI 面板 ---
+        const gui = new GUI({ title: "布光控制台", width: 300 });
+
+        const globalFolder = gui.addFolder('📷 相机与材质');
+        globalFolder.add(config, 'exposure', 0.1, 2.0).name('曝光度').onChange(v => { 
+            renderer.toneMappingExposure = v; saveConfig(); 
+        });
+
+        const updateSkin = () => {
+            // [关键修复]：遍历全局数组，安全无报错
+            if (skinInstances.length > 0) {
+                skinInstances.forEach(m => {
+                    m.roughness = config.skin.roughness;
+                    m.sheen = config.skin.sheen;
+                    m.clearcoat = config.skin.clearcoat;
+                });
+            }
+            saveConfig();
+        };
+        globalFolder.add(config.skin, 'roughness', 0, 1).name('皮肤粗糙').onChange(updateSkin);
+        globalFolder.add(config.skin, 'sheen', 0, 2).name('绒毛感').onChange(updateSkin);
+        globalFolder.add(config.skin, 'clearcoat', 0, 1).name('出油感').onChange(updateSkin);
+
+        Object.keys(lights).forEach(name => {
+            const group = lights[name];
+            const folder = gui.addFolder(name);
+            const p = config.lights[name];
+
+            folder.add(p, 'intensity', 0, 1000).name('亮度').onChange(v => { group.light.intensity = v; saveConfig(); });
+            folder.addColor(p, 'color').name('颜色').onChange(v => { 
+                group.light.color.setHex(v); group.bulb.material.color.setHex(v); saveConfig(); 
+            });
+            folder.add(p, 'angle', -180, 180).name('环绕').onChange(v => { 
+                group.pivot.rotation.y = v * (Math.PI / 180); saveConfig(); 
+            });
+            folder.add(p, 'height', -5, 5).name('高度').onChange(v => { 
+                group.light.position.y = v; group.bulb.position.y = v; saveConfig(); 
+            });
+            folder.add(p, 'dist', 2, 15).name('距离').onChange(v => { 
+                group.light.position.z = v; group.bulb.position.z = v; saveConfig(); 
+            });
+            folder.add(p, 'shadowRadius', 1, 10).name('阴影虚化').onChange(v => { 
+                group.light.shadow.radius = v; saveConfig(); 
+            });
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>

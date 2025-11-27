@@ -2,6 +2,7 @@ import os
 import sqlite3
 import datetime
 import json
+import time
 import threading
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
@@ -9,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image, ImageOps
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Dict
 import hashlib
 # --- 系统文件对话框 ---
 import tkinter as tk
@@ -27,66 +28,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class ReorderRequest(BaseModel):
     photo_paths: List[str]
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # 1. 照片元数据表 (增加 description)
-    # 如果表已存在但没有 description 列，需要手动处理(这里为了简化，建议删除旧db重新生成，或者手动alter)
-    try:
-        c.execute("ALTER TABLE photos ADD COLUMN description TEXT")
-    except:
-        pass  # 列已存在或表不存在
+class ReorderRootsRequest(BaseModel):
+    root_paths: List[str]
 
+class PhotoUpdate(BaseModel):
+    path: str
+    rating: Optional[int] = None
+    color: Optional[str] = None
+    tags: Optional[List[str]] = None
+    description: Optional[str] = None
+
+
+class CoverUpdate(BaseModel):
+    folder: str
+    photo_path: str
+
+
+# --- 数据库处理 ---
+
+def get_db_connection():
+    # timeout=30: 如果数据库被锁，等待30秒而不是立刻报错
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db_connection()
+    c = conn.cursor()
+
+    # ★ 开启 WAL 模式 (Write-Ahead Logging)
+    # 这允许多个读取者和一个写入者同时操作，大幅解决 database is locked 问题
+    c.execute("PRAGMA journal_mode=WAL")
+
+    # 基础表结构
     c.execute('''CREATE TABLE IF NOT EXISTS photos 
                  (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
                   color TEXT, tags TEXT, description TEXT)''')
 
-    # 2. 配置表
     c.execute('''CREATE TABLE IF NOT EXISTS config 
                  (key TEXT PRIMARY KEY, value TEXT)''')
 
-    # 3. 相册封面表 (New)
     c.execute('''CREATE TABLE IF NOT EXISTS album_covers 
                  (folder_path TEXT PRIMARY KEY, photo_path TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS album_ranks 
+                     (folder_path TEXT PRIMARY KEY, rank INTEGER)''')
+    # 动态添加字段 (兼容旧数据库)
+    columns = [
+        ("width", "INTEGER"),
+        ("height", "INTEGER"),
+        ("is_live", "INTEGER DEFAULT 0"),
+        ("rank", "INTEGER DEFAULT 0"),
+        ("last_modified", "REAL DEFAULT 0")  # ★ 新增：记录文件最后修改时间戳
+    ]
 
-    # 1. 修改 photos 表结构，增加 width 和 height
-    # 注意：如果你的 metadata.db 已经存在，建议手动删除该文件让程序重新生成，或者运行下面的补充语句：
-    try:
-        c.execute("ALTER TABLE photos ADD COLUMN width INTEGER")
-        c.execute("ALTER TABLE photos ADD COLUMN height INTEGER")
-    except:
-        pass
-
-        # 确保建表语句包含这两个新字段
-    c.execute('''CREATE TABLE IF NOT EXISTS photos 
-                     (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
-                      color TEXT, tags TEXT, description TEXT, 
-                      width INTEGER, height INTEGER)''')
-    try:
-        c.execute("ALTER TABLE photos ADD COLUMN is_live INTEGER DEFAULT 0")
-    except:
-        pass
-
-        # 确保建表语句也包含
-    c.execute('''CREATE TABLE IF NOT EXISTS photos 
-                     (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
-                      color TEXT, tags TEXT, description TEXT, 
-                      width INTEGER, height INTEGER, is_live INTEGER)''')
-
-    try:
-        c.execute("ALTER TABLE photos ADD COLUMN rank INTEGER DEFAULT 0")
-    except:
-        pass
-
-        # 确保建表语句也包含 rank
-    c.execute('''CREATE TABLE IF NOT EXISTS photos 
-                     (path TEXT PRIMARY KEY, rating INTEGER DEFAULT 0, 
-                      color TEXT, tags TEXT, description TEXT, 
-                      width INTEGER, height INTEGER, is_live INTEGER, 
-                      rank INTEGER DEFAULT 0)''')
+    for col_name, col_type in columns:
+        try:
+            c.execute(f"ALTER TABLE photos ADD COLUMN {col_name} {col_type}")
+        except:
+            pass
 
     conn.commit()
     conn.close()
@@ -96,12 +100,6 @@ init_db()
 
 
 # --- 辅助函数 ---
-
-def get_db_connection():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 
 def get_root_dirs():
     conn = get_db_connection()
@@ -121,7 +119,6 @@ def set_root_dirs(roots: List[str]):
 
 
 def fix_orientation(img):
-    """根据EXIF数据自动旋转图片"""
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
@@ -129,32 +126,246 @@ def fix_orientation(img):
     return img
 
 
-# --- Pydantic Models ---
+def check_is_live(path):
+    try:
+        if not path.lower().endswith(('.jpg', '.jpeg')): return 0
+        if os.path.getsize(path) < 1024 * 1024: return 0
+        with open(path, 'rb') as f:
+            data = f.read()
+            idx = data.rfind(b'ftyp')
+            if idx > 1000: return 1
+    except:
+        pass
+    return 0
 
-class PhotoUpdate(BaseModel):
-    path: str
-    rating: Optional[int] = None
-    color: Optional[str] = None
-    tags: Optional[List[str]] = None
-    description: Optional[str] = None
+
+# --- 核心逻辑优化 ---
+
+def perform_scan_logic():
+    print(f"[{datetime.datetime.now()}] 开始极速扫描...")
+    start_time = time.time()
+    raw_roots = get_root_dirs()
+    root_dirs = get_root_dirs()
+    unique_roots = []
+    sorted_roots = sorted(list(set(raw_roots)), key=len)
+    for r in sorted_roots:
+        r = os.path.normpath(r)
+        # 检查 r 是否是 unique_roots 中某个路径的子目录
+        is_subdir = False
+        for parent in unique_roots:
+            # 简单的字符串前缀检查，加 os.sep 确保是目录匹配
+            if r.startswith(parent + os.sep) or r == parent:
+                is_subdir = True
+                break
+        if not is_subdir:
+            unique_roots.append(r)
+
+    # 如果清理后发现 roots 变少了，说明之前有污染，自动修正配置
+    if len(unique_roots) < len(raw_roots):
+        print(f"发现重复嵌套的根目录，已自动清理: {len(raw_roots)} -> {len(unique_roots)}")
+        set_root_dirs(unique_roots)
+
+    conn = get_db_connection()
+
+    # 1. 预加载所有数据库记录到内存 (HashMap)
+    # 这样后续查询就是 O(1) 的内存操作，不需要反复查询数据库
+    # key: path, value: row
+    print("正在加载数据库缓存...")
+    db_cache = {}
+    try:
+        cursor = conn.execute("SELECT * FROM photos")
+        rows = cursor.fetchall()
+        for row in rows:
+            # 将 sqlite3.Row 转为普通 dict 方便后续使用
+            db_cache[row['path']] = dict(row)
+    except Exception as e:
+        print(f"DB Load Error: {e}")
+    ranks_map = {}
+    try:
+        rows = conn.execute("SELECT folder_path, rank FROM album_ranks").fetchall()
+        for r in rows:
+            ranks_map[r['folder_path']] = r['rank']
+    except:
+        pass
+    # 获取封面 map
+    covers_map = {}
+    try:
+        rows = conn.execute("SELECT folder_path, photo_path FROM album_covers").fetchall()
+        for r in rows:
+            covers_map[r['folder_path']] = r['photo_path']
+    except:
+        pass
+
+    all_galleries = []
+
+    # 待更新/插入的列表 (用于批量写入)
+    to_upsert = []
+
+    scanned_count = 0
+    skipped_count = 0
+
+    for ROOT_DIR in root_dirs:
+        if not os.path.exists(ROOT_DIR): continue
+        ROOT_DIR = os.path.normpath(ROOT_DIR)
+
+        for root, dirs, files in os.walk(ROOT_DIR):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))]
+
+            if not image_files: continue
+
+            album_photos = []
+
+            for f in image_files:
+                full_path = os.path.normpath(os.path.join(root, f))
+
+                # 获取当前文件系统的时间戳
+                try:
+                    current_mtime = os.path.getmtime(full_path)
+                except:
+                    continue  # 文件可能被删了
+
+                # --- ⚡⚡⚡ 极速优化核心 ⚡⚡⚡ ---
+                # 检查缓存里有没有这个文件，且时间戳是否一致
+                cached_data = db_cache.get(full_path)
+
+                need_process = True
+
+                # 如果缓存存在，且文件修改时间(误差0.1秒内)一致，直接使用缓存
+                if cached_data:
+                    last_mod = cached_data.get('last_modified', 0)
+                    if last_mod and abs(last_mod - current_mtime) < 1.0:
+                        # 命中缓存！直接使用数据库数据，完全跳过 Image.open
+                        photo_data = cached_data
+                        need_process = False
+                        skipped_count += 1
+                    else:
+                        # 文件被修改过，需要重新读取
+                        photo_data = cached_data
+                else:
+                    # 新文件
+                    photo_data = {}
+
+                # 只有当需要处理时（新文件 or 被修改）才执行耗时操作
+                if need_process:
+                    scanned_count += 1
+                    width = 0
+                    height = 0
+                    is_live = 0
+
+                    # 尝试读取图片信息
+                    try:
+                        # 只有在新文件或需要更新时才检测 Live
+                        is_live = check_is_live(full_path)
+
+                        with Image.open(full_path) as img:
+                            width, height = img.size
+                    except:
+                        width, height = 100, 100
+
+                    # 准备存入数据库的数据
+                    # 保留原有的用户数据（评分、标签等），只更新文件属性
+                    new_record = {
+                        "path": full_path,
+                        "rating": photo_data.get('rating', 0),
+                        "color": photo_data.get('color', 'none'),
+                        "tags": photo_data.get('tags', ''),
+                        "description": photo_data.get('description', ''),
+                        "width": width,
+                        "height": height,
+                        "is_live": is_live,
+                        "rank": photo_data.get('rank', 0),
+                        "last_modified": current_mtime
+
+                    }
+
+                    to_upsert.append(new_record)
+
+                    # 更新内存里的对象，用于生成前端 JSON
+                    photo_data = new_record
+
+                # 构造前端需要的数据结构
+                tags_list = []
+                if photo_data.get('tags'):
+                    tags_list = photo_data['tags'].split(",")
+
+                album_photos.append({
+                    "name": f,
+                    "path": full_path,
+                    "date": datetime.datetime.fromtimestamp(current_mtime).strftime('%Y-%m-%d'),
+                    "width": photo_data.get('width', 0),
+                    "height": photo_data.get('height', 0),
+                    "rating": photo_data.get('rating', 0),
+                    "color": photo_data.get('color', 'none'),
+                    "tags": tags_list,
+                    "description": photo_data.get('description', ''),
+                    "rank": photo_data.get('rank', 0),
+                    "is_live": photo_data.get('is_live', 0)
 
 
-class CoverUpdate(BaseModel):
-    folder: str
-    photo_path: str
+                })
+
+            # 封面逻辑
+            current_folder_path = os.path.normpath(root)
+            cover_image = covers_map.get(current_folder_path)
+            if not cover_image and album_photos:
+                cover_image = album_photos[0]['path']
+
+            rel_path = os.path.relpath(root, ROOT_DIR)
+            display_name = os.path.basename(ROOT_DIR) if rel_path == "." else os.path.basename(root)
+
+            all_galleries.append({
+                "folder_path": current_folder_path,
+                "name": display_name,
+                "root_root": ROOT_DIR,
+                "rel_path": rel_path,
+                "cover": cover_image,
+                "photos": album_photos,
+                "count": len(album_photos),
+                "rank": ranks_map.get(current_folder_path, 999999)
+            })
+
+    # 3. 批量写入数据库 (Batch Insert/Update)
+    if to_upsert:
+        print(f"正在批量更新数据库 ({len(to_upsert)} 条记录)...")
+        try:
+            # 使用 INSERT OR REPLACE
+            sql = '''INSERT OR REPLACE INTO photos 
+                     (path, rating, color, tags, description, width, height, is_live, rank, last_modified) 
+                     VALUES (:path, :rating, :color, :tags, :description, :width, :height, :is_live, :rank, :last_modified)'''
+            conn.executemany(sql, to_upsert)
+            conn.commit()
+        except Exception as e:
+            print(f"Batch Update Error: {e}")
+
+    all_galleries.sort(key=lambda x: (x['rank'], x['name']))
+
+    try:
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(all_galleries, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"Cache write error: {e}")
+
+    conn.close()
+
+    end_time = time.time()
+    print(f"扫描完成。耗时: {end_time - start_time:.2f}秒. 跳过: {skipped_count}, 处理: {scanned_count}")
+
+    return all_galleries
+
+
+def background_scan_task():
+    perform_scan_logic()
 
 
 # --- API ---
 
 @app.get("/api/pick_folder")
 def pick_folder():
-    """在服务端打开文件夹选择框"""
     try:
-        # Tkinter 必须在主线程运行，或者需要特殊处理。
-        # 对于本地单人应用，这样简单的调用通常可行。
         root = tk.Tk()
-        root.withdraw()  # 隐藏主窗口
-        root.attributes('-topmost', True)  # 确保弹窗在最前
+        root.withdraw()
+        root.attributes('-topmost', True)
         folder_selected = filedialog.askdirectory()
         root.destroy()
 
@@ -176,285 +387,143 @@ def list_roots():
     return get_root_dirs()
 
 
+# 新增/替换 API
+@app.post("/api/reorder_albums")  # 改个名字区分一下
+def reorder_albums_api(data: ReorderRootsRequest):
+    try:
+        conn = get_db_connection()
+        # 批量更新 rank
+        # data.root_paths 是前端排好序的列表，index 就是 rank
+        params = [(i, path) for i, path in enumerate(data.root_paths)]
+
+        # 使用 REPLACE INTO 确保存在
+        conn.executemany("INSERT OR REPLACE INTO album_ranks (rank, folder_path) VALUES (?, ?)", params)
+
+        conn.commit()
+        conn.close()
+
+        # 删除缓存，强制刷新
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+
+        return {"status": "success"}
+    except Exception as e:
+        print(e)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/api/roots")
 def delete_root(path: str):
     roots = get_root_dirs()
-    if path in roots:
-        roots.remove(path)
+    norm_path = os.path.normpath(path)
+    target_to_remove = None
+    for r in roots:
+        if os.path.normpath(r).lower() == norm_path.lower():
+            target_to_remove = r
+            break
+    if target_to_remove:
+        roots.remove(target_to_remove)
         set_root_dirs(roots)
-    return {"status": "success", "roots": roots}
+        if os.path.exists(CACHE_FILE):
+            try:
+                os.remove(CACHE_FILE)
+            except:
+                pass
+        return {"status": "success", "roots": roots}
+    return {"status": "error", "message": "Root not found"}
 
 
-def check_is_live(path):
-    """检测是否为 Live Photo (通过检查文件末尾是否包含 MP4 结构)"""
-    try:
-        if not path.lower().endswith(('.jpg', '.jpeg')):
-            return 0
-
-        # 预判：文件太小肯定不是 Live
-        file_size = os.path.getsize(path)
-        if file_size < 1024 * 1024:  # 小于 1MB 直接跳过
-            return 0
-
-        with open(path, 'rb') as f:
-            # 优化：为了性能，我们不需要读整个文件来检测
-            # 只需要读最后 20MB (通常 Live 视频不会特别大) 或者读全部
-            # 如果不想改太复杂，读全部也是最稳的
-            data = f.read()
-
-            # 逻辑必须和 get_live_video 保持一致
-            idx = data.rfind(b'ftyp')
-
-            # 如果找到了 ftyp，且位置不在文件开头（说明是拼接在后面的），就认为是 Live
-            if idx > 1000:  # 至少给 JPG 留点空间
-                return 1
-
-    except Exception as e:
-        print(f"Check live error: {e}")
-        pass
-
-    return 0
-def perform_scan_logic():
-    root_dirs = get_root_dirs()
-    conn = get_db_connection()
-
-    # 获取所有自定义封面
-    covers_map = {}
-    rows = conn.execute("SELECT folder_path, photo_path FROM album_covers").fetchall()
-    for r in rows:
-        covers_map[r['folder_path']] = r['photo_path']
-
-    all_galleries = []
-
-    for ROOT_DIR in root_dirs:
-        if not os.path.exists(ROOT_DIR):
-            continue
-
-        ROOT_DIR = os.path.normpath(ROOT_DIR)
-
-        # 遍历目录
-        for root, dirs, files in os.walk(ROOT_DIR):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-
-            image_files = [f for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'))]
-
-            if not image_files:
-                continue
-
-            # 构建相册信息
-            album_photos = []
-
-            # 批量获取元数据
-            # 这里的逻辑稍微简化，对于大量图片可能需要优化SQL查询
-            for f in image_files:
-                full_path = os.path.normpath(os.path.join(root, f))
-
-                row = conn.execute(
-                    "SELECT rating, color, tags, description, width, height, is_live, rank FROM photos WHERE path=?",
-                    (full_path,)).fetchone()
-
-                tags_list = []
-                if row and row['tags']:
-                    tags_list = row['tags'].split(",")
-                is_live = row['is_live'] if row else 0
-                # 如果数据库里是 0，但我们没扫过（或者想强制重扫），可以重新检测
-                # 这里逻辑：如果是新插入的(row不存在)，检测一下
-                if not row or is_live == 0:
-                    # 只有当确实检测到是 1 时，我们才更新。如果是 0，保持原状（避免重复检测耗时，虽然这里简单处理了）
-                    # 为了更严谨，我们可以每次都检测，但为了性能，这里假设如果已经是 1 了就不用测了
-                    if is_live == 0:
-                        detected_live = check_is_live(full_path)
-                        if detected_live:
-                            is_live = 1
-                            # 记得把新状态更新回数据库！
-                            conn.execute("UPDATE photos SET is_live=1 WHERE path=?", (full_path,))
-                            conn.commit()
-                width = row['width'] if row else 0
-                height = row['height'] if row else 0
-
-                # 如果数据库里没有宽高数据，才去打开文件读取 (懒加载)
-                if not width or not height:
-                    try:
-                        with Image.open(full_path) as img:
-                            width, height = img.size
-                            # 将读取到的宽高存回数据库，下次就不读文件了
-                            conn.execute("UPDATE photos SET width=?, height=? WHERE path=?", (width, height, full_path))
-                            conn.commit()  # 记得提交
-                    except:
-                        width, height = 100, 100
-
-                album_photos.append({
-                    "name": f,
-                    "path": full_path,
-                    "date": datetime.datetime.fromtimestamp(os.path.getmtime(full_path)).strftime('%Y-%m-%d'),
-                    "width": width,
-                    "height": height,
-                    "rating": row['rating'] if row else 0,
-                    "color": row['color'] if row else "none",
-                    "tags": tags_list,
-                    "description": row['description'] if row else "",
-                    "rank": row['rank'] if row else 0,
-                    "is_live": is_live
-                })
-
-            # 确定封面
-            current_folder_path = os.path.normpath(root)
-            cover_image = None
-
-            # 1. 用户自定义封面
-            if current_folder_path in covers_map and os.path.exists(covers_map[current_folder_path]):
-                cover_image = covers_map[current_folder_path]
-            # 2. 默认第一张
-            elif album_photos:
-                cover_image = album_photos[0]['path']
-
-            # 计算相对层级结构
-            rel_path = os.path.relpath(root, ROOT_DIR)
-            if rel_path == ".":
-                display_name = os.path.basename(ROOT_DIR)
-                parent = None
-            else:
-                display_name = os.path.basename(root)
-                parent = os.path.dirname(rel_path)  # 逻辑上的父级标识，前端用来构建树
-
-            all_galleries.append({
-                "folder_path": current_folder_path,  # 唯一ID
-                "name": display_name,
-                "root_root": ROOT_DIR,  # 所属的根库
-                "rel_path": rel_path,  # 相对路径
-                "cover": cover_image,
-                "photos": album_photos,
-                "count": len(album_photos)
-            })
-    try:
-        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(all_galleries, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"Cache write error: {e}")
-
-    conn.close()
-    return all_galleries
-
-def background_scan_task():
-    print("开始后台扫描...")
-    perform_scan_logic()
-    print("后台扫描完成，缓存已更新")
-
-
-# 5. 重写 API 接口 scan_photos
 @app.get("/api/scan")
 def scan_photos(background_tasks: BackgroundTasks, force: bool = False):
-    """
-    1. 如果有缓存文件，直接返回缓存 (极快)。
-    2. 同时在后台启动扫描任务，更新缓存。
-    3. 如果没有缓存(第一次运行)，则同步扫描并返回。
-    """
-    # 如果强制刷新 或者 没有缓存文件，必须同步扫描
     if force or not os.path.exists(CACHE_FILE):
         return perform_scan_logic()
-
-    # 有缓存：先触发后台更新，然后立马返回旧数据
     background_tasks.add_task(background_scan_task)
-
     try:
         with open(CACHE_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
         return data
     except:
-        # 缓存读取失败，降级为同步扫描
         return perform_scan_logic()
+
 
 @app.post("/api/reorder")
 def reorder_photos(data: ReorderRequest):
     try:
         conn = get_db_connection()
-        # 批量更新 rank
-        # 为了性能，使用 executemany
         params = [(i, path) for i, path in enumerate(data.photo_paths)]
         conn.executemany("UPDATE photos SET rank=? WHERE path=?", params)
         conn.commit()
         conn.close()
         return {"status": "success"}
     except Exception as e:
-        print(f"Reorder error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/reorder_roots")
+def reorder_roots(data: ReorderRootsRequest):
+    """更新根目录的顺序"""
+    try:
+        # data.root_paths 是前端传来的排好序的路径列表
+        # 我们直接覆盖 config 表里的 roots
+        set_root_dirs(data.root_paths)
+
+        # 顺便清空缓存，强制下次刷新
+        if os.path.exists(CACHE_FILE):
+            try:
+                os.remove(CACHE_FILE)
+            except:
+                pass
+
+        return {"status": "success"}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/live_video")
 def get_live_video(path: str):
-    """从 Live Photo 中提取视频流"""
-    if not os.path.exists(path):
-        return FileResponse(path)
-
+    if not os.path.exists(path): return FileResponse(path)
     try:
         with open(path, 'rb') as f:
             data = f.read()
-
         idx = data.rfind(b'ftyp')
-
         if idx > 4:
-            video_start = idx - 4
-            # ... (中间的校验逻辑保持不变) ...
-            video_data = data[video_start:]
-
-            # --- 修改重点：添加 Cache-Control 头 (缓存1年) ---
+            video_data = data[idx - 4:]
             headers = {"Cache-Control": "public, max-age=31536000"}
+            return StreamingResponse(BytesIO(video_data), media_type="video/mp4", headers=headers)
+        raise HTTPException(status_code=404, detail="No video found")
+    except:
+        raise HTTPException(status_code=500, detail="Error")
 
-            return StreamingResponse(
-                BytesIO(video_data),
-                media_type="video/mp4",
-                headers=headers  # <--- 加上这个
-            )
-        else:
-            raise HTTPException(status_code=404, detail="No video found")
 
-    except Exception as e:
-        print(f"Video extract error: {e}")
-        raise HTTPException(status_code=500, detail="Error extracting video")
+@app.get("/api/download")
+def download_image(path: str):
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    filename = os.path.basename(path)
+    return FileResponse(path, filename=filename)
 
-# 定义缓存目录
+
+# 缩略图缓存
 THUMB_CACHE_DIR = ".thumb_cache"
-if not os.path.exists(THUMB_CACHE_DIR):
-    os.makedirs(THUMB_CACHE_DIR)
+if not os.path.exists(THUMB_CACHE_DIR): os.makedirs(THUMB_CACHE_DIR)
 
 
 @app.get("/api/image")
 def get_image(path: str, thumb: bool = False):
-    if not os.path.exists(path):
-        return FileResponse(path)  # 404 处理
-
-    # 设置浏览器缓存头 (缓存 1 年)
+    if not os.path.exists(path): return FileResponse(path)
     headers = {"Cache-Control": "public, max-age=31536000"}
-
     if thumb:
-        # 生成唯一的缩略图文件名 (使用路径的 MD5)
         path_hash = hashlib.md5(path.encode('utf-8')).hexdigest()
-        thumb_filename = f"{path_hash}.jpg"
-        thumb_path = os.path.join(THUMB_CACHE_DIR, thumb_filename)
-
-        # 1. 如果硬盘上已经有缩略图缓存，直接返回文件
+        thumb_path = os.path.join(THUMB_CACHE_DIR, f"{path_hash}.jpg")
         if os.path.exists(thumb_path):
             return FileResponse(thumb_path, headers=headers)
-
-        # 2. 如果没有，生成并保存
         try:
             with Image.open(path) as img:
                 img = fix_orientation(img)
-                if img.mode in ("RGBA", "P"):
-                    img = img.convert("RGB")
-
+                if img.mode in ("RGBA", "P"): img = img.convert("RGB")
                 img.thumbnail((400, 400))
-
-                # 保存到缓存文件夹
                 img.save(thumb_path, format="JPEG", quality=80)
-
-                # 返回生成的文件
                 return FileResponse(thumb_path, headers=headers)
-        except Exception as e:
-            print(f"Thumb error: {e}")
-            # 出错降级返回原图
-            return FileResponse(path, headers=headers)
-
-    # 返回原图时也加上缓存头
+        except:
+            pass
     return FileResponse(path, headers=headers)
 
 
@@ -462,22 +531,34 @@ def get_image(path: str, thumb: bool = False):
 def update_metadata(data: PhotoUpdate):
     try:
         conn = get_db_connection()
+        # 先尝试插入(如果不存在)，如果存在则忽略
         conn.execute("INSERT OR IGNORE INTO photos (path) VALUES (?)", (data.path,))
 
+        updates = []
+        params = []
         if data.rating is not None:
-            conn.execute("UPDATE photos SET rating=? WHERE path=?", (data.rating, data.path))
+            updates.append("rating=?")
+            params.append(data.rating)
         if data.color is not None:
-            conn.execute("UPDATE photos SET color=? WHERE path=?", (data.color, data.path))
+            updates.append("color=?")
+            params.append(data.color)
         if data.description is not None:
-            conn.execute("UPDATE photos SET description=? WHERE path=?", (data.description, data.path))
+            updates.append("description=?")
+            params.append(data.description)
         if data.tags is not None:
-            tags_str = ",".join(data.tags)
-            conn.execute("UPDATE photos SET tags=? WHERE path=?", (tags_str, data.path))
+            updates.append("tags=?")
+            params.append(",".join(data.tags))
 
-        conn.commit()
+        if updates:
+            sql = f"UPDATE photos SET {', '.join(updates)} WHERE path=?"
+            params.append(data.path)
+            conn.execute(sql, params)
+            conn.commit()
+
         conn.close()
         return {"status": "success"}
     except Exception as e:
+        print(f"Update error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -490,29 +571,20 @@ def set_album_cover(data: CoverUpdate):
         conn.commit()
         conn.close()
         return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except:
+        raise HTTPException(status_code=500, detail="Error")
 
 
 @app.get("/{full_path:path}")
 async def serve_spa(full_path: str):
-    """
-    处理前端路由：
-    1. 如果请求的是存在的文件（比如 css, js, map），直接返回文件
-    2. 否则统一返回 index.html，让 Vue Router 接管
-    """
-    # 如果请求的是实际存在的文件（例如 index.html 本身，或者打包后的资源）
     if os.path.exists(full_path) and os.path.isfile(full_path):
         return FileResponse(full_path)
-
-    # 否则全部返回 index.html
-    # (记得用 resource_path 处理打包后的路径，如果你还没打包，直接用 'index.html')
     return FileResponse('index.html')
+
 
 if __name__ == "__main__":
     import uvicorn
 
-    # 确保 metadata.db 存在
     if not os.path.exists(DB_FILE):
         init_db()
     print("启动中... 请访问 http://localhost:8000")

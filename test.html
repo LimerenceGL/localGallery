@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>低调肖像三灯布光图</title>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        canvas {
+            background-color: #2b2b2b;
+            border-radius: 4px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            max-width: 100%;
+        }
+        .legend {
+            margin-top: 20px;
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            max-width: 800px;
+            width: 100%;
+        }
+        .legend-item {
+            background: #333;
+            padding: 10px;
+            border-left: 4px solid #f4a261;
+            font-size: 14px;
+        }
+        h2 { margin-bottom: 10px; color: #fff; }
+        .note { color: #aaa; font-size: 12px; margin-top: 5px; }
+    </style>
+</head>
+<body>
+
+    <h2>三灯人像布光图 (Top-Down View)</h2>
+    <canvas id="lightingCanvas" width="800" height="600"></canvas>
+
+    <div class="legend">
+        <div class="legend-item" style="border-left-color: #f4a261;">
+            <strong>1. 主光 (Key Light)</strong>
+            <div class="note">位置：7-8点钟方向。必加格栅(Grid)。<br>关键：光心不要直对脸，要"扫"过鼻尖(羽化)。</div>
+        </div>
+        <div class="legend-item" style="border-left-color: #2a9d8f;">
+            <strong>2. 轮廓光 (Rim Light)</strong>
+            <div class="note">位置：1-2点钟方向。束光筒或窄光。<br>关键：勾勒左侧肩膀和头发，必须极弱。</div>
+        </div>
+        <div class="legend-item" style="border-left-color: #e76f51;">
+            <strong>3. 黑色吸光板 (Negative Fill)</strong>
+            <div class="note">位置：模特左侧。<br>关键：这一步最重要！用来吸收反光，制造深邃阴影。</div>
+        </div>
+        <div class="legend-item" style="border-left-color: #264653;">
+            <strong>相机与模特</strong>
+            <div class="note">模特脸微转向主光。<br>相机使用长焦段 (85mm+)。</div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('lightingCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Helper functions
+        function drawGrid() {
+            ctx.strokeStyle = '#3a3a3a';
+            ctx.lineWidth = 1;
+            for (let i = 0; i < canvas.width; i += 40) {
+                ctx.beginPath();
+                ctx.moveTo(i, 0);
+                ctx.lineTo(i, canvas.height);
+                ctx.stroke();
+            }
+            for (let i = 0; i < canvas.height; i += 40) {
+                ctx.beginPath();
+                ctx.moveTo(0, i);
+                ctx.lineTo(canvas.width, i);
+                ctx.stroke();
+            }
+        }
+
+        function drawSubject(x, y) {
+            // Head
+            ctx.beginPath();
+            ctx.arc(x, y, 25, 0, Math.PI * 2);
+            ctx.fillStyle = '#ddd';
+            ctx.fill();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Nose indicator (pointing slightly left/down)
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x - 10, y + 20);
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Shoulders
+            ctx.beginPath();
+            ctx.ellipse(x, y + 10, 55, 20, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = '#888';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+
+            // Label
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText("模特", x, y - 40);
+            ctx.font = '12px Arial';
+            ctx.fillStyle = '#aaa';
+            ctx.fillText("(脸微转向主光)", x, y - 55);
+        }
+
+        function drawCamera(x, y) {
+            ctx.fillStyle = '#666';
+            ctx.fillRect(x - 15, y, 30, 20);
+            ctx.beginPath();
+            ctx.moveTo(x - 20, y + 20);
+            ctx.lineTo(x, y);
+            ctx.lineTo(x + 20, y + 20);
+            ctx.strokeStyle = '#666';
+            ctx.stroke();
+
+            // Lens direction
+            ctx.beginPath();
+            ctx.setLineDash([5, 5]);
+            ctx.moveTo(x, y);
+            ctx.lineTo(x, y - 200);
+            ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'center';
+            ctx.fillText("相机", x, y + 40);
+        }
+
+        function drawSoftbox(x, y, angle, label, color, isGrid) {
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(angle * Math.PI / 180);
+
+            // Light Ray
+            ctx.beginPath();
+            ctx.moveTo(-30, 0);
+            ctx.lineTo(-60, 250);
+            ctx.lineTo(60, 250);
+            ctx.lineTo(30, 0);
+            const gradient = ctx.createLinearGradient(0, 0, 0, 250);
+            gradient.addColorStop(0, color);
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Box
+            ctx.fillStyle = '#222';
+            ctx.fillRect(-30, -20, 60, 30);
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 3;
+            ctx.strokeRect(-30, -20, 60, 30);
+
+            // Grid indication
+            if (isGrid) {
+                ctx.beginPath();
+                ctx.moveTo(-20, 0); ctx.lineTo(-20, 10);
+                ctx.moveTo(-10, 0); ctx.lineTo(-10, 10);
+                ctx.moveTo(0, 0); ctx.lineTo(0, 10);
+                ctx.moveTo(10, 0); ctx.lineTo(10, 10);
+                ctx.moveTo(20, 0); ctx.lineTo(20, 10);
+                ctx.strokeStyle = '#000';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                ctx.fillStyle = '#f4a261';
+                ctx.font = '10px Arial';
+                ctx.fillText("Grid", 35, 5);
+            }
+
+            ctx.restore();
+
+            // Label
+            ctx.fillStyle = color;
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText(label, x, y - 35);
+        }
+
+        function drawRimLight(x, y, angle) {
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(angle * Math.PI / 180);
+
+            // Narrow Beam
+            ctx.beginPath();
+            ctx.moveTo(-10, 0);
+            ctx.lineTo(-20, 150);
+            ctx.lineTo(20, 150);
+            ctx.lineTo(10, 0);
+            const gradient = ctx.createLinearGradient(0, 0, 0, 150);
+            gradient.addColorStop(0, 'rgba(42, 157, 143, 0.6)'); // Blue/Green
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            // Snoot/Fixture
+            ctx.fillStyle = '#222';
+            ctx.fillRect(-15, -20, 30, 30);
+            ctx.strokeStyle = '#2a9d8f';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(-15, -20, 30, 30);
+
+            ctx.restore();
+
+            ctx.fillStyle = '#2a9d8f';
+            ctx.textAlign = 'center';
+            ctx.fillText("2. 轮廓光", x, y - 30);
+            ctx.font = '10px Arial';
+            ctx.fillText("(极弱/束光筒)", x, y - 18);
+        }
+
+        function drawFlag(x, y) {
+            ctx.save();
+            ctx.translate(x, y);
+
+            ctx.beginPath();
+            ctx.moveTo(0, -40);
+            ctx.lineTo(0, 40);
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 6;
+            ctx.stroke();
+
+            // Dashed interaction line
+            ctx.beginPath();
+            ctx.setLineDash([2, 4]);
+            ctx.moveTo(0, 0);
+            ctx.lineTo(-40, 0);
+            ctx.strokeStyle = '#555';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            ctx.restore();
+
+            ctx.fillStyle = '#ccc';
+            ctx.textAlign = 'center';
+            ctx.fillText("黑色吸光板", x + 50, y);
+            ctx.font = '10px Arial';
+            ctx.fillText("(加深阴影)", x + 50, y + 15);
+        }
+
+        function drawOptionalFill(x, y) {
+            // Draw a ghosted light
+            ctx.save();
+            ctx.globalAlpha = 0.3;
+            drawSoftbox(x, y, -45, "", "#fff", false);
+            ctx.restore();
+
+            ctx.fillStyle = '#777';
+            ctx.textAlign = 'center';
+            ctx.fillText("3. 补光 (备用)", x, y - 35);
+            ctx.font = '10px Arial';
+            ctx.fillText("如果有三盏灯", x, y - 20);
+            ctx.fillText("保持关闭或开最小", x, y - 8);
+        }
+
+        function drawFeatherLine(cx, cy, lx, ly) {
+             // Calculate angle
+             // Just purely graphical representation
+             ctx.beginPath();
+             ctx.moveTo(lx, ly);
+             ctx.lineTo(cx + 40, cy + 20); // Aiming PAST the subject
+             ctx.strokeStyle = 'rgba(244, 162, 97, 0.5)';
+             ctx.setLineDash([5, 5]);
+             ctx.lineWidth = 1;
+             ctx.stroke();
+             ctx.setLineDash([]);
+
+             ctx.fillStyle = '#f4a261';
+             ctx.font = '10px Arial';
+             ctx.fillText("光轴中心 (扫过脸部)", cx - 120, cy + 80);
+        }
+
+        // Execution
+        drawGrid();
+
+        const centerX = 400;
+        const centerY = 300;
+
+        // Subject
+        drawSubject(centerX, centerY);
+
+        // Camera
+        drawCamera(centerX, 550);
+
+        // 1. Key Light (Left side, aiming down-right)
+        // Positioned at approx 7 o'clock
+        drawSoftbox(200, 450, -35, "1. 主光 (关键)", "rgba(244, 162, 97, 0.8)", true);
+        // Visualizing Feathering: The light is aiming slightly IN FRONT OF the model
+        drawFeatherLine(centerX, centerY, 200, 450);
+
+        // 2. Rim Light (Back Right)
+        drawRimLight(550, 150, 150);
+
+        // Negative Fill (Right side)
+        drawFlag(500, centerY);
+
+        // 3. Optional Fill (Far Right)
+        drawOptionalFill(650, 400);
+
+    </script>
+</body>
+</html>
